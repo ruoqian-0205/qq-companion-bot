@@ -40,7 +40,7 @@ bot.py ──> NapCat ──> QQ ──> 用户收到回复
 - Python 3.9+
 - 一个可登录的 QQ 号(建议小号)
 - [NapCat](https://github.com/NapNeko/NapCatQQ)(napcat 本体,独立运行)
-- DeepSeek 与阿里云 DashScope(通义千问)的 API Key
+- DeepSeek 与阿里云 DashScope(通义千问)的 API Key（也可以根据需要换用其他文本和视觉大模型API）
 
 ## 🚀 快速开始
 
