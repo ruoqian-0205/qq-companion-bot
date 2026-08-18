@@ -40,7 +40,7 @@ bot.py ──> NapCat ──> QQ ──> 用户收到回复
 - Python 3.9+
 - 一个可登录的 QQ 号(建议小号)
 - [NapCat](https://github.com/NapNeko/NapCatQQ)(napcat 本体,独立运行)
-- DeepSeek 与阿里云 DashScope(通义千问)的 API Key（也可以根据需要换用其他文本和视觉大模型API）
+- DeepSeek 与阿里云 DashScope(通义千问)的 API Key（也可以根据需要换用其他平台的大模型API）
 
 ## 🚀 快速开始
 
@@ -65,11 +65,11 @@ cp .env.example .env
 编辑 `.env`,填入两个 API Key:
 
 ```ini
-DEEPSEEK_API_KEY=你的DeepSeek密钥
-ALI_API_KEY=你的阿里云DashScope密钥
+TEXT_API_KEY=你的DeepSeek密钥
+VISION_API_KEY=你的阿里云DashScope密钥
 ```
 
-> `ALI_API_KEY` 在 [阿里云百炼控制台](https://bailian.console.aliyun.com/) 获取;`DEEPSEEK_API_KEY` 在 [DeepSeek 开放平台](https://platform.deepseek.com/) 获取。
+> `VISION_API_KEY` 在 [阿里云百炼控制台](https://bailian.console.aliyun.com/) 获取;`TEXT_API_KEY` 在 [DeepSeek 开放平台](https://platform.deepseek.com/) 获取。
 
 ### 4. 配置文件(config.json)
 
@@ -107,38 +107,38 @@ python bot.py --debug
 
 ## ⚙️ 配置详解(config.json)
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `bot_name` | `小深` | 机器人名字,会替换人设中的 `{bot_name}` |
-| `persona_file` | `persona.txt` | 人设文件路径(也可直接用 `persona` 字段内联) |
-| `ws_url` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
-| `deepseek_base_url` | `https://api.deepseek.com` | 文本模型接口地址(OpenAI 兼容) |
-| `deepseek_model` | `deepseek-v4-flash` | 文本模型名,可换成其他模型 |
-| `ali_base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 视觉模型接口地址(OpenAI 兼容) |
-| `vision_model` | `qwen3.7-flash` | 视觉模型名,可换成 `qwen-vl-plus` 等 |
-| `max_images_per_message` | `3` | 单条消息最多识别几张图,超出部分不识别 |
-| `bot_qq` | — | 机器人 QQ 号 |
-| `private_whitelist` | `[]` | 私聊白名单 |
-| `group_whitelist` | `[]` | 群聊白名单 |
-| `group_at_only` | `true` | 群聊是否仅在被 @ 时回复 |
-| `group_reply_probability` | `0.8` | 被 @ 时的回复概率 |
-| `group_keyword_probability` | `0.7` | 命中关键词时的回复概率 |
-| `group_active_probability` | `0.6` | 活跃期内(刚聊过)的回复概率 |
-| `group_default_probability` | `0.1` | 默认(潜水)时的回复概率 |
-| `group_active_window` | `600` | 活跃期时长(秒),机器人发过消息后计入活跃 |
+| 配置项                             | 默认值 | 说明 |
+|---------------------------------| --- | --- |
+| `bot_name`                      | `小深` | 机器人名字,会替换人设中的 `{bot_name}` |
+| `persona_file`                  | `persona.txt` | 人设文件路径(也可直接用 `persona` 字段内联) |
+| `ws_url`                        | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
+| `text_base_url`                 | `https://api.deepseek.com` | 文本模型接口地址(OpenAI 兼容) |
+| `text_model`                    | `deepseek-v4-flash` | 文本模型名,可换成其他模型 |
+| `vision_base_url`               | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 视觉模型接口地址(OpenAI 兼容) |
+| `vision_model`                  | `qwen3.7-flash` | 视觉模型名,可换成 `qwen-vl-plus` 等 |
+| `max_images_per_message`        | `3` | 单条消息最多识别几张图,超出部分不识别 |
+| `bot_qq`                        | — | 机器人 QQ 号 |
+| `private_whitelist`             | `[]` | 私聊白名单 |
+| `group_whitelist`               | `[]` | 群聊白名单 |
+| `group_at_only`                 | `true` | 群聊是否仅在被 @ 时回复 |
+| `group_reply_probability`       | `0.8` | 被 @ 时的回复概率 |
+| `group_keyword_probability`     | `0.7` | 命中关键词时的回复概率 |
+| `group_active_probability`      | `0.6` | 活跃期内(刚聊过)的回复概率 |
+| `group_default_probability`     | `0.1` | 默认(潜水)时的回复概率 |
+| `group_active_window`           | `600` | 活跃期时长(秒),机器人发过消息后计入活跃 |
 | `group_max_consecutive_replies` | `5` | 活跃期内最多连续回复条数,防止刷屏 |
-| `keywords` | `["小深", "猫娘"]` | 触发回复的关键词 |
-| `reply_probability` | `0.7` | 私聊回复概率 |
-| `fallback_reply` | `喵……刚才网络开小差了，再说一次好不好？` | 模型调用失败时的兜底回复 |
-| `clear_memory_reply` | `喵~ 记忆已经清空啦，我们重新开始吧！` | 执行"清空记忆"指令后的回复 |
-| `proactive_interval_private` | `[1800, 7200]` | 私聊主动开场白间隔范围(秒),随机取值 |
-| `proactive_interval_group` | `[10800, 21600]` | 群聊主动开场白间隔范围(秒) |
-| `proactive_to_each` | `0.5` | 每轮主动消息中,对每个对象发起概率 |
-| `memory_max_messages` | `40` | 每个会话保留的最大消息条数 |
-| `memory_file` | `memory.json` | 记忆文件路径(自动生成,勿手动编辑) |
-| `enable_silent_hours` | `true` | 是否启用静音时段 |
-| `silent_hours_start` | `0` | 静音时段开始(小时,北京时间) |
-| `silent_hours_end` | `10` | 静音时段结束(小时,北京时间) |
+| `keywords`                      | `["小深", "猫娘"]` | 触发回复的关键词 |
+| `reply_probability`             | `0.7` | 私聊回复概率 |
+| `fallback_reply`                | `喵……刚才网络开小差了，再说一次好不好？` | 模型调用失败时的兜底回复 |
+| `clear_memory_reply`            | `喵~ 记忆已经清空啦，我们重新开始吧！` | 执行"清空记忆"指令后的回复 |
+| `proactive_interval_private`    | `[1800, 7200]` | 私聊主动开场白间隔范围(秒),随机取值 |
+| `proactive_interval_group`      | `[10800, 21600]` | 群聊主动开场白间隔范围(秒) |
+| `proactive_to_each`             | `0.5` | 每轮主动消息中,对每个对象发起概率 |
+| `memory_max_messages`           | `40` | 每个会话保留的最大消息条数 |
+| `memory_file`                   | `memory.json` | 记忆文件路径(自动生成,勿手动编辑) |
+| `enable_silent_hours`           | `true` | 是否启用静音时段 |
+| `silent_hours_start`            | `0` | 静音时段开始(小时,北京时间) |
+| `silent_hours_end`              | `10` | 静音时段结束(小时,北京时间) |
 
 ## 🧠 内置指令
 
@@ -148,7 +148,7 @@ python bot.py --debug
 
 ## 🔒 隐私与安全
 
-- 所有密钥存放在 `.env`(`DEEPSEEK_API_KEY` / `ALI_API_KEY`),已在 `.gitignore` 中排除,**切勿提交**
+- 所有密钥存放在 `.env`(`TEXT_API_KEY` / `VISION_API_KEY`),已在 `.gitignore` 中排除,**切勿提交**
 - 实际配置 `config.json`、人设 `persona.txt`、记忆 `memory.json` 均含个人/隐私信息,已加入 `.gitignore`,**不会推送到仓库**
 - 公开仓库只包含示例文件(`config.example.json`、`persona.example.txt`、`.env.example`)
 - 建议给机器人使用小号,并在 `whitelist` 中严格控制可对话对象

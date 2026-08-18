@@ -3,9 +3,9 @@
   "persona_file": "persona.txt",
 
   "ws_url": "ws://127.0.0.1:3001",
-  "deepseek_base_url": "https://api.deepseek.com",
-  "deepseek_model": "deepseek-v4-flash",
-  "ali_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "text_base_url": "https://api.deepseek.com",
+  "text_model": "deepseek-v4-flash",
+  "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "vision_model": "qwen3.7-flash",
   "max_images_per_message": 3,
 

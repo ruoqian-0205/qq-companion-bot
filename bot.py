@@ -15,11 +15,11 @@ from dotenv import load_dotenv
 load_dotenv()   # 读 .env
 
 # ---- 机密：从 .env 读取 ----
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-ALI_API_KEY = os.getenv("ALI_API_KEY", "")
+TEXT_API_KEY = os.getenv("TEXT_API_KEY", "")
+VISION_API_KEY = os.getenv("VISION_API_KEY", "")
 
 # 启动校验，防止忘了配 Key
-if not DEEPSEEK_API_KEY or not ALI_API_KEY:
+if not TEXT_API_KEY or not VISION_API_KEY:
     raise SystemExit("缺少 API Key！请在 .env 中配置")
 
 # ---- 普通配置：从 config.json 读取 ----
@@ -27,9 +27,9 @@ with open("config.json", "r", encoding="utf-8") as _f:
     CFG = json.load(_f)
 
 WS_URL = CFG["ws_url"]
-DEEPSEEK_BASE_URL = CFG["deepseek_base_url"]
-DEEPSEEK_MODEL = CFG["deepseek_model"]
-ALI_BASE_URL = CFG["ali_base_url"]
+TEXT_BASE_URL = CFG["text_base_url"]
+TEXT_MODEL = CFG["text_model"]
+VISION_BASE_URL = CFG["vision_base_url"]
 VISION_MODEL = CFG["vision_model"]
 MAX_IMAGES_PER_MESSAGE = CFG["max_images_per_message"]
 
@@ -80,16 +80,16 @@ log = logging.getLogger("DeepSeekBot")
 
 # DeepSeek 客户端
 client = AsyncOpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url=DEEPSEEK_BASE_URL,
+    api_key=TEXT_API_KEY,
+    base_url=TEXT_BASE_URL,
     timeout=30.0,
     max_retries=2
 )
 
 # 视觉模型客户端（通义千问 VL）
 vision_client = AsyncOpenAI(
-    api_key=ALI_API_KEY,
-    base_url=ALI_BASE_URL,
+    api_key=VISION_API_KEY,
+    base_url=VISION_BASE_URL,
     timeout=30.0,
     max_retries=1
 )
@@ -231,7 +231,7 @@ async def chat_with_deepseek(key: str, user_text: str | None = None) -> str:
 
     try:
         resp = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=TEXT_MODEL,
             messages=msgs,
             temperature=1.3,
             top_p=0.9,
@@ -288,7 +288,7 @@ async def proactive_chat(key: str) -> str | None:
                             "说一句简短、自然、贴合人设的开场白，不要提到'自动'或'机器人'）"})
     try:
         resp = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=TEXT_MODEL,
             messages=msgs,
             temperature=1.3,
             max_tokens=200
