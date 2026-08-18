@@ -1,6 +1,6 @@
 # QQ DeepSeek Bot
 
-一个基于 **NapCat** 正向 WebSocket 的 QQ 机器人,由本地 Python 脚本驱动。
+一个**通过 NapCat 接入 QQ 消息**的机器人,由本地 Python 脚本驱动。
 
 - **文字对话**:DeepSeek 纯文本大模型(`deepseek-v4-flash`)
 - **图片识别**:阿里云通义千问视觉模型(`qwen3.7-flash`)
