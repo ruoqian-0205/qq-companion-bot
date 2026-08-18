@@ -11,6 +11,8 @@ import websockets
 from openai import AsyncOpenAI
 import os
 from dotenv import load_dotenv
+import uuid
+import base64
 
 load_dotenv()   # 读 .env
 
@@ -102,6 +104,9 @@ group_active_until: dict[int, float] = {}
 
 # 群聊连续回复计数：群号 -> 次数
 group_consecutive_replies: dict[int, int] = {}
+
+# NapCat API 请求-响应匹配:echo -> asyncio.Future
+pending_actions: dict[str, asyncio.Future] = {}
 
 # ---------- 时间工具 ----------
 def get_beijing_time_str() -> str:
@@ -247,10 +252,59 @@ async def chat_with_deepseek(key: str, user_text: str | None = None) -> str:
         append_memory(key, "assistant", fallback)
         return fallback
 
+# ---------- NapCat API 请求 ----------
+async def call_napcat(ws, action: str, params: dict) -> dict | None:
+    """向 NapCat 发送 API 请求并等待响应(10 秒超时)。"""
+    echo = uuid.uuid4().hex
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    pending_actions[echo] = fut
+    await ws.send(json.dumps({"action": action, "params": params, "echo": echo},
+                             ensure_ascii=False))
+    try:
+        return await asyncio.wait_for(fut, timeout=10)
+    except asyncio.TimeoutError:
+        log.warning(f"NapCat API 超时: {action}")
+        return None
+    finally:
+        pending_actions.pop(echo, None)
+
+# ---------- 图片获取(读 NapCat 本地缓存,绕开腾讯防盗链) ----------
+async def get_image_base64(ws, file_name: str) -> str | None:
+    """
+    通过 NapCat 获取图片缓存内容并转为 base64 data URL。
+    腾讯图片链接带防盗链和时效,NapCat 本地必然已有缓存,读取缓存即可绕过。
+    """
+    # 方案1:get_file(扩展 API,直接返回 base64 内容)
+    try:
+        info = await call_napcat(ws, "get_file", {"file_id": file_name})
+        if info and info.get("base64"):
+            fn = info.get("file") or ""
+            mime = "image/png" if fn.lower().endswith(".png") else "image/jpeg"
+            return f"data:{mime};base64,{info['base64']}"
+    except Exception as e:
+        log.error(f"get_file 失败: {e}")
+
+    # 方案2:get_image(标准 API,拿本地缓存路径再读文件)
+    try:
+        info = await call_napcat(ws, "get_image", {"file": file_name})
+        if info:
+            path = info.get("file") or ""
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    raw = f.read()
+                mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+                return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+            log.warning(f"get_image 返回的路径不存在: {path}")
+    except Exception as e:
+        log.error(f"get_image 失败: {e}")
+
+    return None
+
 # ---------- 视觉模型调用（图片转文字） ----------
-async def image_to_text(image_url: str, sub_type: int = 0) -> str:
+async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
     """
     根据 sub_type 选择提示词，识别图片或表情包。
+    img: {"url":..., "file":..., "sub_type":...}
     sub_type: 0=普通图片, 2/7=表情包（QQ常见）
     """
     if sub_type in (2, 7):
@@ -261,13 +315,24 @@ async def image_to_text(image_url: str, sub_type: int = 0) -> str:
     else:
         prompt = "请用中文描述这张图片的内容及必要的文字原文消息内容。直接描述，不要解释过程。"
 
+    # 优先取 NapCat 本地缓存(绕开腾讯防盗链),拿不到就返回失败
+    file_name = img.get("file") or ""
+    if not file_name:
+        log.warning(f"图片无缓存文件名,跳过识别: {str(img.get('url'))[:60]}...")
+        return ""
+
+    image_data = await get_image_base64(ws, file_name)
+    if not image_data:
+        log.warning(f"无法获取图片内容,跳过识别: file={file_name} url={str(img.get('url'))[:60]}...")
+        return ""
+
     try:
         resp = await vision_client.chat.completions.create(
             model=VISION_MODEL,
             messages=[
                 {"role": "user", "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}}
+                    {"type": "image_url", "image_url": {"url": image_data}}
                 ]}
             ],
             max_tokens=500
@@ -323,7 +388,9 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                         sub_type = int(sub_type)
                     except (ValueError, TypeError):
                         sub_type = 0
-                    images.append({"url": url, "sub_type": sub_type})
+                    images.append({"url": url,
+                                   "file": data.get("file", ""),
+                                   "sub_type": sub_type})
                 else:
                     log.warning("收到图片但无 URL：%s", data)
     else:
@@ -380,7 +447,7 @@ async def handle_message(ws, data: dict):
             type_tag = "【表情包】" if is_sticker else "【图片】"
 
             if idx <= MAX_IMAGES_PER_MESSAGE:
-                desc = await image_to_text(img["url"], sub_type)
+                desc = await image_to_text(ws, img, sub_type)
                 if desc:
                     descriptions.append(f"第{idx}张：{type_tag}{desc}")
                 else:
@@ -526,6 +593,12 @@ async def main():
                 try:
                     async for raw in ws:
                         data = json.loads(raw)
+                        echo = data.get("echo")
+                        if echo and echo in pending_actions:
+                            fut = pending_actions.pop(echo)
+                            if not fut.done():
+                                fut.set_result(data.get("data"))
+                            continue
                         if data.get("post_type") == "message":
                             asyncio.create_task(safe_handle_message(ws, data))
                 finally:
