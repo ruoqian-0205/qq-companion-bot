@@ -6,7 +6,7 @@
 - **图片识别**:阿里云通义千问视觉模型(`qwen3.7-flash`)
 - 两个模型均可通过 `config.json` 一键更换为任意 OpenAI 兼容接口
 
-只需运行 NapCat 正向代理 + 本地运行 `bot.py`,即可让 QQ 号上线成为会聊天的 AI 机器人。
+只需运行 NapCat(开启 **WebSocket 服务端**,即社区常说的"正向 WebSocket")+ 本地运行 `bot.py`,即可让 QQ 号上线成为会聊天的 AI 机器人。
 
 > ⚠️ 本项目基于 MIT 许可证开源,可自由使用、修改与二次开发。接入 QQ 属于非官方行为,请自行遵守 QQ 平台规范及 NapCat 项目的使用条款,由此产生的一切风险与后果由使用者自行承担。
 
@@ -32,7 +32,7 @@
 bot.py ──> NapCat ──> QQ ──> 用户收到回复
 ```
 
-- **NapCat** 负责与 QQ 协议的交互,以正向 WebSocket(默认 `ws://127.0.0.1:3001`)推送事件给 `bot.py`
+- **NapCat** 负责与 QQ 协议的交互,以正向 WebSocket(默认 `ws://127.0.0.1:3001`)推送事件给 `bot.py`(**NapCat 为服务端,bot.py 为客户端,由 bot.py 主动连接**)
 - **bot.py** 只做两件事:把消息加工后交给大模型,再把回复发回 NapCat
 
 ## 📦 环境要求
@@ -52,9 +52,13 @@ cd qq-deepseek-bot
 pip install -r requirements.txt
 ```
 
-### 2. 运行 NapCat 正向代理
+### 2. 运行 NapCat(开启正向 WebSocket)
 
-参考 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 官方文档完成安装与登录,并开启**正向 WebSocket**(默认端口 `3001`,与 `config.json` 中的 `ws_url` 保持一致)。
+参考 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 官方文档完成安装与登录,然后在 NapCat 的网络配置中开启 **WebSocket 服务端**(即"正向 WebSocket"),监听端口默认 `3001`。
+
+这里的"正向"指连接方向:**NapCat 作为服务端监听端口,`bot.py` 作为客户端主动连接它**(即 `ws_url`)。与之相对的是"反向 WebSocket"(NapCat 主动连你的程序,常用于机器人跑在远程服务器的场景),本项目不需要,请勿混淆。
+
+请确保 NapCat 监听的端口与 `config.json` 中的 `ws_url` 保持一致。
 
 ### 3. 配置密钥(.env)
 
@@ -175,10 +179,10 @@ qq-deepseek-bot/
 A: 确认已创建 `.env` 并填写两个 Key;确认当前目录就是项目根目录。
 
 **Q: 日志一直显示连接断开/重连**
-A: 确认 NapCat 已开启正向 WebSocket,且端口与 `ws_url` 一致(默认 `3001`);检查防火墙是否放行。
+A: 确认 NapCat 已开启 WebSocket 服务端(正向),且端口与 `ws_url` 一致(默认 `3001`);检查防火墙是否放行。
 
 **Q: 收到图片不识别或显示"图片加载失败"**
-A: 视觉模型需要能访问图片 URL。若 QQ 图片链接无法访问(如内网/区域限制),可尝试更换 NapCat 的图片下载/上报配置。
+A: 程序会通过 NapCat 的 `get_file`/`get_image` API 读取图片**本地缓存**再交给视觉模型,不依赖 QQ 图片链接,通常无需额外配置。若仍失败,请检查 NapCat 是否正常运行、图片是否已缓存成功(重启 NapCat 后重试)。
 
 **Q: 群聊里机器人不回复**
 A: 确认群号在白名单、`group_at_only` 与回复概率符合预期;概率机制下部分消息会故意不回复,这是特性不是 Bug。
