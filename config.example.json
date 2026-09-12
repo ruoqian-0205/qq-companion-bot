@@ -4,7 +4,8 @@
 
   "ws_url": "ws://127.0.0.1:3001",
   "text_base_url": "https://api.deepseek.com",
-  "text_model": "deepseek-v4-flash",
+  "text_model": "deepseek-flash",
+  "enable_thinking": true,
   "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
   "vision_model": "qwen3.7-flash",
   "max_images_per_message": 3,
@@ -33,5 +34,16 @@
   "memory_file": "memory.json",
   "enable_silent_hours": true,
   "silent_hours_start": 0,
-  "silent_hours_end": 10
+  "silent_hours_end": 10,
+
+  "long_memory_enabled": true,
+  "lm_file": "memory_long.json",
+  "lm_l0_max": 160,
+  "lm_compress_count": 80,
+  "lm_compress_delay": 3,
+  "lm_l1_target_chars": 1000,
+  "lm_l1_accept_chars": 1500,
+  "lm_l1_inject_chars": 800,
+  "lm_thinking": true,
+  "lm_max_tokens": 16000
 }
