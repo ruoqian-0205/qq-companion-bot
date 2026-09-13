@@ -895,19 +895,12 @@ def _spawn_autologin_sync() -> str:
     return ""
 
 
-async def handle_scan_login() -> bool:
-    """快速登录失败、需要扫码时的处理：弹出二维码并询问用户怎么做。
+async def ensure_qr_page() -> None:
+    """把本次新生成的二维码渲染成 HTML 并打开浏览器（仅在用户选择直接扫码时调用）。
 
-    返回 True  = 代码继续正常运行（用户选择直接扫码）
-    返回 False = 需要停止 bot（用户选择手动重建快速登录凭证）
+    若现有二维码文件是上一轮遗留的旧图，先删掉并等 NapCat 写新的，
+    避免把过期二维码弹给用户白扫一次。
     """
-    global scan_prompt_active, need_manual_recovery
-    if scan_prompt_active:
-        return True
-    scan_prompt_active = True
-
-    # 0) 确保二维码是"本次"新生成的：旧文件（上一轮扫码留下的）直接清掉再等新的，
-    #    否则会把过期二维码弹给用户，白扫一次。
     mt = qr_file_mtime()
     if mt and (time.time() - mt) > 60:
         log.info("检测到旧的二维码文件，先清掉并等待本次新生成的二维码 ...")
@@ -919,9 +912,7 @@ async def handle_scan_login() -> bool:
             await asyncio.sleep(2)
             if qr_file_mtime() > 0:
                 break
-    log.warning(f"快速登录未成功，进入扫码处理（二维码 {QRCODE_IMAGE}）")
 
-    # 1) 把 NapCat 生成的二维码渲染成 HTML（内嵌 base64，单文件即可打开）
     url_line = ""
     try:
         log_text = open(QRCONSOLE_LOG, "r", encoding="utf-8", errors="replace").read()
@@ -930,35 +921,51 @@ async def handle_scan_login() -> bool:
             url_line = found[-1]
     except FileNotFoundError:
         pass
-    if os.path.exists(QRCODE_IMAGE):
-        try:
-            with open(QRCODE_IMAGE, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            html = (
-                "<!doctype html><meta charset='utf-8'><title>NapCat 扫码登录</title>"
-                "<body style='font-family:system-ui;text-align:center;padding:28px'>"
-                "<h2>请用手机 QQ 扫码登录</h2>"
-                f"<img src='data:image/png;base64,{b64}' style='width:280px;height:280px;image-rendering:pixelated'>"
-                "<p style='color:#a00'>二维码几分钟内有效，过期请重新运行 bot.py</p>"
-                + (f"<p>扫不出来可用链接自行生成二维码：<br><code style='font-size:12px'>{url_line}</code></p>" if url_line else "")
-                + "<p style='color:#666;font-size:13px'>扫码后在手机 QQ 上点「授权登录」</p></body>"
-            )
-            html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "napcat-qrcode.html")
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            os.startfile(html_path)          # 用默认浏览器弹出二维码
-            log.warning(f"已弹出二维码页面：{html_path}")
-        except Exception as e:
-            log.error(f"生成二维码页面失败：{e}")
-    else:
-        log.error(f"未找到二维码图片 {QRCODE_IMAGE}")
 
+    if not os.path.exists(QRCODE_IMAGE):
+        log.error(f"未找到二维码图片 {QRCODE_IMAGE}")
+        return
+    try:
+        with open(QRCODE_IMAGE, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        html = (
+            "<!doctype html><meta charset='utf-8'><title>NapCat 扫码登录</title>"
+            "<body style='font-family:system-ui;text-align:center;padding:28px'>"
+            "<h2>请用手机 QQ 扫码登录</h2>"
+            f"<img src='data:image/png;base64,{b64}' style='width:280px;height:280px;image-rendering:pixelated'>"
+            "<p style='color:#a00'>二维码几分钟内有效，过期请重新运行 bot.py</p>"
+            + (f"<p>扫不出来可用链接自行生成二维码：<br><code style='font-size:12px'>{url_line}</code></p>" if url_line else "")
+            + "<p style='color:#666;font-size:13px'>扫码后在手机 QQ 上点「授权登录」</p></body>"
+        )
+        html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "napcat-qrcode.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        os.startfile(html_path)          # 用默认浏览器弹出二维码
+        log.warning(f"已弹出二维码页面：{html_path}")
+    except Exception as e:
+        log.error(f"生成二维码页面失败：{e}")
+
+
+async def handle_scan_login() -> bool:
+    """快速登录失败、需要扫码时的处理：弹出二维码并询问用户怎么做。
+
+    返回 True  = 代码继续正常运行（用户选择直接扫码）
+    返回 False = 需要停止 bot（用户选择手动重建快速登录凭证）
+    """
+    global scan_prompt_active, need_manual_recovery
+    if scan_prompt_active:
+        return True
+    scan_prompt_active = True
+
+    log.warning(f"快速登录未成功，需要扫码登录（二维码 {QRCODE_IMAGE}）")
+
+    # 1) 先让用户决定：默认手动重建凭证；选择直接扫码时才弹出二维码
     log.warning("=" * 60)
     log.warning("快速登录失败 —— 需要扫码登录。请选择：")
     log.warning("  [Y/回车] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
     log.warning("            （会结束 NapCat/QQ 进程并停止 bot.py）")
     log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
-    log.warning("  [N]      就现在扫上面这个二维码登录（需要人工点授权，不支持无人值守）")
+    log.warning("  [N]      就现在扫码登录（需要人工点授权，不支持无人值守）")
     log.warning("=" * 60)
     ans = (await asyncio.to_thread(input, "请选择 [Y/n]: ")).strip().lower()
 
@@ -979,6 +986,7 @@ async def handle_scan_login() -> bool:
         scan_prompt_active = False
         return False
 
+    await ensure_qr_page()
     log.info("已选择直接扫码登录，请在浏览器中扫码授权；NapCat 上线后会自动继续运行。")
     if await wait_online_recovery(180, 10):
         log.info("扫码登录成功，NapCat 已上线")
