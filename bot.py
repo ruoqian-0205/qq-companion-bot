@@ -975,9 +975,18 @@ async def handle_scan_login() -> bool:
     print("=" * 58)
     print("  回车 = 选 Y")
     print()
-    sys.stdout.write("  请输入 y 或 n: ")
-    sys.stdout.flush()
-    ans = (await asyncio.to_thread(input)).strip().lower()
+    # 读取选择期间临时静音日志：日志走 stderr、菜单走 stdout，
+    # 两者交错会把提示符和菜单冲散。这里短暂摘掉 root 的 handlers 实现静音，
+    # 读完立刻恢复（日志本身不会丢失，只是这几秒不输出）。
+    # 注意：不能用 logger.addFilter —— filter 对子 logger 传播上来的记录不生效。
+    _saved_handlers = logging.getLogger().handlers[:]
+    logging.getLogger().handlers = []
+    try:
+        sys.stdout.write("  请输入 y 或 n: ")
+        sys.stdout.flush()
+        ans = (await asyncio.to_thread(input)).strip().lower()
+    finally:
+        logging.getLogger().handlers = _saved_handlers
     print()
     log.info("扫码流程：用户选择了 %s" % ("Y（手动重建凭证）" if ans in ("", "y", "yes") else "N（直接扫码）"))
 
