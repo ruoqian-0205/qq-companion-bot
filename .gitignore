@@ -6,6 +6,8 @@
 config.json
 persona.txt
 persona.local.txt
+me.txt
+me.*.txt
 
 # 记忆文件（自动生成，含聊天隐私，务必不要提交）
 memory.json
