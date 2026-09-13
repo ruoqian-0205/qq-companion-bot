@@ -959,12 +959,14 @@ async def handle_scan_login() -> bool:
 
     log.info("快速登录未成功，需要扫码登录")
 
-    # 用 print 而不是 log：log 每行都带"时间戳 [级别]"前缀，会把菜单撑成一堆噪音
+    # 用 print 而不是 log：log 每行都带"时间戳 [级别]"前缀，会把菜单撑成一堆噪音。
+    # 提示符用 sys.stdout.write + flush 手工输出：这样光标停在提示符后面，
+    # 不会被随后落下的日志行挤到行尾（input() 的内置 prompt 在那种情况下会被推走）。
     print()
     print("=" * 58)
     print("  快速登录失败，需要扫码登录。请选择：")
     print()
-    print("   [Y] 先手动登录一次以重建凭证（推荐）")
+    print("   [Y] 手动登录一次以重建凭证（推荐）")
     print("       之后掉线可自动快速登录；会结束 NapCat/QQ 并停止 bot.py")
     print("       注意：若你平时不用 QQ 客户端，重建后仍可能无法自动上线")
     print()
@@ -973,7 +975,10 @@ async def handle_scan_login() -> bool:
     print("=" * 58)
     print("  回车 = 选 Y")
     print()
-    ans = (await asyncio.to_thread(input, "  请输入 y 或 n: ")).strip().lower()
+    sys.stdout.write("  请输入 y 或 n: ")
+    sys.stdout.flush()
+    ans = (await asyncio.to_thread(input)).strip().lower()
+    print()
     log.info("扫码流程：用户选择了 %s" % ("Y（手动重建凭证）" if ans in ("", "y", "yes") else "N（直接扫码）"))
 
     if ans in ("", "y", "yes"):
