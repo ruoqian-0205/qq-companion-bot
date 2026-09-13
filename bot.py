@@ -977,18 +977,26 @@ async def handle_scan_login() -> bool:
     # 提示符放在菜单最后一行：光标就在提示符后面，不会被日志行在视觉上挤走。
     # 读取期间临时摘掉 root 的 handlers 静音日志，避免菜单被日志冲散
     # （注意：不能用 logger.addFilter —— filter 对子 logger 传播上来的记录不生效）。
-    # input 走 to_thread 并加超时：万一终端不响应（IDE 捕获 stdin 等），
-    # 也不会永久卡死，而是按默认值 Y 继续。
+    #
+    # 输入读取用 sys.stdin.readline() 而不是 input()：
+    # 1) 能区分“读到空行（用户按了回车）”与“读到 EOF（输入流不可用/被重定向）”
+    # 2) 避免 input() 在个别 IDE / 重定向环境下不返回的问题
     _saved_handlers = logging.getLogger().handlers[:]
     logging.getLogger().handlers = []
     try:
-        sys.stdout.write("  回车 = 选 Y；请输入 y 或 n: ")
+        sys.stdout.write("  回车 = 选 Y；请输入 y 或 n（若按键无反应，试试切到英文输入法）: ")
         sys.stdout.flush()
         try:
-            ans = (await asyncio.wait_for(asyncio.to_thread(input), timeout=180)).strip().lower()
+            line = await asyncio.wait_for(asyncio.to_thread(sys.stdin.readline), timeout=180)
         except asyncio.TimeoutError:
+            line = "\n"
             log.warning("等待选择超时（180 秒），按默认 Y 处理")
+        if line == "":
+            log.warning("标准输入不可读（EOF）—— 常见于输出被重定向或终端不提供输入，"
+                        "按默认 Y 处理；想直接扫码请改为手工运行 bot.py 并在终端里选择")
             ans = ""
+        else:
+            ans = line.strip().lower()
     finally:
         logging.getLogger().handlers = _saved_handlers
     print()
