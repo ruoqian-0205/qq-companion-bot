@@ -55,6 +55,7 @@
   "lm_l1_target_chars": 1000,
   "lm_l1_accept_chars": 1500,
   "lm_l1_inject_chars": 800,
+  "lm_l0_hard_limit": 480,
   "lm_thinking": true,
   "lm_max_tokens": 16000
 }

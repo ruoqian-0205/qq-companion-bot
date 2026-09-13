@@ -16,6 +16,7 @@ import base64
 import socket
 import atexit
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 load_dotenv()   # 读 .env
@@ -104,6 +105,9 @@ LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
 LM_L1_TARGET_CHARS = CFG.get("lm_l1_target_chars", 1000)
 LM_L1_ACCEPT_CHARS = CFG.get("lm_l1_accept_chars", 1500)
 LM_L1_INJECT_CHARS = CFG.get("lm_l1_inject_chars", 800)
+# 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
+# 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
+LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
 
 # 记忆整理（压缩）是否开启思考模式。默认跟随全局 enable_thinking。
 # 实测：开启思考后判断力明显更好——能正确区分"已撤销/已放弃"与"仍有效"的事件，
@@ -188,7 +192,8 @@ last_activity: dict[str, float] = {}
 pending_actions: dict[str, asyncio.Future] = {}
 
 # ---------- NapCat 掉线自愈状态 ----------
-is_online = True                 # 缓存的在线状态，由 check_online() 更新
+# 注：曾有一个全局 is_online 缓存，但没有任何地方读取它（生成前检查用的是
+# check_online() 的返回值），属于死变量，已移除，避免误导后来者。
 relogin_task: asyncio.Task | None = None      # 在途的重登任务
 relogin_attempts: list[float] = []            # 最近的重登时间戳，用于限流
 relogin_failures = 0                          # 连续失败次数，用于退避
@@ -214,6 +219,13 @@ compress_scheduled: set[str] = set()
 
 # 在途压缩任务：key -> asyncio.Task，仅用于让离线测试/诊断能等待压缩完成
 compress_tasks: dict[str, asyncio.Task] = {}
+
+# 正在压缩中的 key。与 compress_scheduled 的区别：
+#   compress_scheduled 只覆盖"已调度、还没开始"的短暂窗口（任务一开跑就清除）
+#   compressing 覆盖"整个压缩过程"（含锁外那次长达数秒的 LLM 调用）
+# 少了它就会出现：LLM 调用期间用户继续聊天 → 再起一个压缩任务 →
+# 两个任务基于同一份旧 L1 各算一遍，后提交的把先提交的成果覆盖掉（丢事实）。
+compressing: set[str] = set()
 
 
 def get_mem_lock(key: str) -> asyncio.Lock:
@@ -272,11 +284,23 @@ def clean_reply(text: str) -> str:
 
 # ---------- 记忆读写 ----------
 def _atomic_write_json(path: str, data) -> None:
-    """原子写：先写临时文件再替换，避免进程被杀时留下半截 JSON 把记忆文件弄坏。"""
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """原子写：先写临时文件再替换，避免进程被杀时留下半截 JSON 把记忆文件弄坏。
+
+    临时文件名带进程号：多个 bot 进程同时写同一个记忆文件时，若共用固定名
+    `<path>.tmp`，会互相覆盖甚至撞上"文件被占用"（WinError 32）。
+    写入失败时清理临时文件，避免残留旧内容误导排查。
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 def load_memory():
     global memories
@@ -319,13 +343,23 @@ async def append_memory(key: str, role: str, content: str):
 
     时间戳写入行为与改造前完全一致；区别只在于本函数改为 async，并要求调用方持有该 key 的锁，
     从而保证"追加 + 落盘"是原子的，避免同一用户连发消息时互相覆盖。
-    群聊沿用 memory_max_messages 硬截断；私聊不截断，交给长期记忆压缩机制接管窗口长度。
+    群聊沿用 memory_max_messages 硬截断；私聊正常交给长期记忆压缩接管窗口长度，
+    但保留一个远高于阈值的兜底上限——万一压缩持续失败（如 API 长期故障），
+    上下文不会无限膨胀导致每轮请求越来越慢、越来越贵。
     """
     time_str = get_beijing_time_str()
     content = f"[{time_str}] {content}"
     memories.setdefault(key, []).append({"role": role, "content": content})
-    if key.startswith("g:") and len(memories[key]) > MEMORY_MAX_MESSAGES:
-        memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
+    if key.startswith("g:"):
+        if len(memories[key]) > MEMORY_MAX_MESSAGES:
+            memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
+    elif LONG_MEMORY_ENABLED and len(memories[key]) > LM_L0_HARD_LIMIT:
+        # 兜底：正常压缩会在 LM_L0_MAX 就收口，只有压缩持续失败才会走到这里
+        keep = LM_L0_HARD_LIMIT
+        dropped = len(memories[key]) - keep
+        memories[key] = memories[key][-keep:]
+        log.warning(f"私聊 {key} 记忆超过兜底上限 {LM_L0_HARD_LIMIT} 条，"
+                    f"已丢弃最早 {dropped} 条（说明长期记忆压缩持续失败，请检查 API 与配置）")
     save_memory()
 
 # ---------- 群聊活跃期 ----------
@@ -633,6 +667,7 @@ async def compress_memory(key: str, gen: int) -> None:
     - 提交顺序必须是「先写 L1、再裁 L0」，中途崩溃最坏只是重复压缩，不会丢消息
     """
     try:
+        compressing.add(key)   # 整个压缩过程占位，防止并发压缩用过期的 L1 互相覆盖
         if LM_COMPRESS_DELAY > 0:
             await asyncio.sleep(LM_COMPRESS_DELAY)  # 合并窗口 + 避开主回复请求
 
@@ -703,6 +738,10 @@ async def compress_memory(key: str, gen: int) -> None:
         # 兜底：任何意外都不能把主对话链路带崩
         compress_scheduled.discard(key)
         log.exception(f"长期记忆压缩异常（{key}）：{e}")
+    finally:
+        # 无论成功、失败还是被取消，都要释放"压缩中"标记，
+        # 否则该会话再也不会触发下一次压缩
+        compressing.discard(key)
 
 
 def maybe_schedule_compress(key: str) -> None:
@@ -715,8 +754,8 @@ def maybe_schedule_compress(key: str) -> None:
         return
     if len(memories.get(key, [])) < LM_L0_MAX:
         return
-    if key in compress_scheduled:
-        return  # 已有一次压缩排在队列里
+    if key in compress_scheduled or key in compressing:
+        return  # 已有压缩在排队或正在执行，等它跑完再基于它的结果继续
     compress_scheduled.add(key)
     task = asyncio.create_task(compress_memory(key, generations.get(key, 0)))
     compress_tasks[key] = task
@@ -782,18 +821,16 @@ async def call_napcat(ws, action: str, params: dict) -> dict | None:
 # 此时若还指望"通过 WebSocket 查询在线状态"，就会陷入死锁式依赖。
 # 因此：连接断开本身就是不可用的最强信号，由重连循环直接触发重登。
 async def check_online(ws) -> bool:
-    """通过已有连接查询账号是否在线，并刷新全局缓存 is_online。
+    """通过已有连接查询账号是否在线。
 
     连接异常/超时都视为不在线。复用主循环的连接，实测单次约 0.6ms，
     因此可以在每次生成消息前放心调用。
     """
-    global is_online
     try:
         data = await call_napcat(ws, "get_status", {})
-        is_online = bool(data and data.get("online"))
+        return bool(data and data.get("online"))
     except Exception:
-        is_online = False
-    return is_online
+        return False
 
 
 async def check_online_standalone(timeout: float = 8.0) -> bool:
@@ -946,6 +983,17 @@ async def ensure_qr_page() -> None:
         log.error(f"生成二维码页面失败：{e}")
 
 
+# 扫码选择专用线程：asyncio 默认线程池只有 4 个槽，而扫码输入会长时间占用一个
+# （用户可能拖很久才回），与自愈里的 to_thread(_spawn_autologin_sync) 争抢，
+# 极端情况下会让后者排队、表现为"点了没反应"。单独开一个池隔离掉。
+_stdin_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stdin")
+
+
+async def _read_stdin_line() -> str:
+    """在线程池里读一行输入（阻塞调用，不能直接放在事件循环里）。"""
+    return await asyncio.get_running_loop().run_in_executor(_stdin_pool, sys.stdin.readline)
+
+
 async def handle_scan_login() -> bool:
     """快速登录失败、需要扫码时的处理：弹出二维码并询问用户怎么做。
 
@@ -972,7 +1020,7 @@ async def handle_scan_login() -> bool:
     # 手工输出能保证它独占一行、出现在所有日志的最后。
     print()
     print("请选择 [Y/n]: ", end="", flush=True)
-    ans = (await asyncio.to_thread(input)).strip().lower()
+    ans = (await _read_stdin_line()).strip().lower()
     print()
 
     if ans in ("", "y", "yes"):
@@ -1084,14 +1132,14 @@ def _spawn_relogin(reason: str) -> None:
 
 async def relogin_watchdog(ws):
     """定期巡检账号状态，发现离线就触发自动重登（失败按 1/5/15 分钟退避）。"""
-    global is_online
+    last_online = True          # 上一次巡检结果，仅用于打印状态变化
     await asyncio.sleep(5)
     while True:
         try:
             online = await check_online(ws)
-            if online != is_online:
-                log.info(f"账号在线状态变化：{is_online} → {online}")
-            is_online = online
+            if online != last_online:
+                log.info(f"账号在线状态变化：{last_online} → {online}")
+            last_online = online
             if not online:
                 if not AUTO_RELOGIN:
                     log.warning("账号离线，但 auto_relogin 已关闭，不执行自动重登")
@@ -1343,7 +1391,9 @@ async def handle_message(ws, data: dict):
         async with get_mem_lock(key):
             if "清空记忆" in text:
                 clear_long_memory(key)   # 清 L0 + L1，并让在途压缩作废
-                await send_private_msg(ws, uid, CLEAR_MEMORY_REPLY)
+                if not await send_private_msg(ws, uid, CLEAR_MEMORY_REPLY):
+                    # 记忆确实已清空，只是回复没送出去；记日志以免用户以为没生效而反复发
+                    log.warning(f"清空记忆已执行，但确认回复未送达 uid={uid}")
                 return
 
             await append_memory(key, "user", combined_text)
@@ -1383,8 +1433,9 @@ async def handle_message(ws, data: dict):
 
         if "清空记忆" in text:
             clear_long_memory(key)
-            await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY,
-                                 at_qq=uid if mentioned else None)
+            if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY,
+                                        at_qq=uid if mentioned else None):
+                log.warning(f"清空记忆已执行，但确认回复未送达 gid={gid}")
             return
 
         async with get_mem_lock(key):
