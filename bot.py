@@ -73,6 +73,10 @@ AUTOLOGIN_SCRIPT = CFG.get("autologin_script", "napcat-autologin.bat")
 HEALTH_CHECK_INTERVAL = CFG.get("health_check_interval", 30)     # 看门狗巡检间隔（秒）
 RELOGIN_WAIT_SECONDS = CFG.get("relogin_wait_seconds", 180)      # 触发后等待上线的最长时间
 RELOGIN_MAX_PER_HOUR = CFG.get("relogin_max_per_hour", 2)        # 每小时最多自动重登次数
+# 快速登录失败、需要扫码时的二维码来源（NapCat 会生成图片与含解码 URL 的控制台日志）
+QRCODE_IMAGE = CFG.get("qrcode_image", r"D:\tools\NapCat\cache\qrcode.png")
+QRCONSOLE_LOG = CFG.get("qrconsole_log") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "napcat-autologin.log")
 
 MEMORY_MAX_MESSAGES = CFG["memory_max_messages"]
 MEMORY_FILE = CFG["memory_file"]
@@ -181,6 +185,7 @@ is_online = True                 # 缓存的在线状态，由 check_online() �
 relogin_task: asyncio.Task | None = None      # 在途的重登任务
 relogin_attempts: list[float] = []            # 最近的重登时间戳，用于限流
 relogin_failures = 0                          # 连续失败次数，用于退避
+need_manual_recovery = False                  # 用户选择手动重建凭证 → 主循环据此优雅退出
 
 # ---------- 长期记忆状态 ----------
 # 记忆库：key -> {"version": int, "updated": str, "facts": [ {t,c,seen,exp,n} ]}
@@ -852,12 +857,83 @@ def _spawn_autologin_sync() -> str:
     return ""
 
 
+async def handle_scan_login() -> bool:
+    """快速登录失败、需要扫码时的处理：弹出二维码并询问用户怎么做。
+
+    返回 True  = 代码继续正常运行（用户选择直接扫码）
+    返回 False = 需要停止 bot（用户选择手动重建快速登录凭证）
+    """
+    # 1) 把 NapCat 生成的二维码渲染成 HTML（内嵌 base64，单文件即可打开）
+    url_line = ""
+    try:
+        log_text = open(QRCONSOLE_LOG, "r", encoding="utf-8", errors="replace").read()
+        found = re.findall(r"二维码解码URL:\s*(\S+)", log_text)
+        if found:
+            url_line = found[-1]
+    except FileNotFoundError:
+        pass
+    if os.path.exists(QRCODE_IMAGE):
+        try:
+            with open(QRCODE_IMAGE, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            html = (
+                "<!doctype html><meta charset='utf-8'><title>NapCat 扫码登录</title>"
+                "<body style='font-family:system-ui;text-align:center;padding:28px'>"
+                "<h2>请用手机 QQ 扫码登录</h2>"
+                f"<img src='data:image/png;base64,{b64}' style='width:280px;height:280px;image-rendering:pixelated'>"
+                "<p style='color:#a00'>二维码几分钟内有效，过期请重新运行 bot.py</p>"
+                + (f"<p>扫不出来可用链接自行生成二维码：<br><code style='font-size:12px'>{url_line}</code></p>" if url_line else "")
+                + "<p style='color:#666;font-size:13px'>扫码后在手机 QQ 上点「授权登录」</p></body>"
+            )
+            html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "napcat-qrcode.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            os.startfile(html_path)          # 用默认浏览器弹出二维码
+            log.warning(f"已弹出二维码页面：{html_path}")
+        except Exception as e:
+            log.error(f"生成二维码页面失败：{e}")
+    else:
+        log.error(f"未找到二维码图片 {QRCODE_IMAGE}")
+
+    log.warning("=" * 60)
+    log.warning("快速登录失败 —— 需要扫码登录。请选择：")
+    log.warning("  [Y/回车] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
+    log.warning("            （会结束 NapCat/QQ 进程并停止 bot.py）")
+    log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
+    log.warning("  [N]      就现在扫上面这个二维码登录（需要人工点授权，不支持无人值守）")
+    log.warning("=" * 60)
+    ans = (await asyncio.to_thread(input, "请选择 [Y/n]: ")).strip().lower()
+
+    if ans in ("", "y", "yes"):
+        # 手动恢复：结束进程并停止 bot，让用户登录 QQ 客户端重建凭证（会关闭自动重登）
+        log.warning("已选择手动恢复：正在结束 NapCat / QQ 进程并停止 bot ...")
+        for img in ("QQ.exe", "NapCatWinBootMain.exe"):
+            try:
+                subprocess.run(["taskkill", "/f", "/im", img],
+                               capture_output=True, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception:
+                pass
+        log.warning("处理完毕。请按以下步骤恢复「自动快速登录」：")
+        log.warning("  1. 手动启动 NapCat（launcher.bat），在 QQ 客户端里完成登录")
+        log.warning("  2. 确认能正常收发消息后，退出 QQ 登录")
+        log.warning("  3. 重新运行 bot.py —— 之后掉线就能自动拉起")
+        return False
+
+    log.info("已选择直接扫码登录，请在浏览器中扫码授权；NapCat 上线后会自动继续运行。")
+    if await wait_online_recovery(180, 10):
+        log.info("扫码登录成功，NapCat 已上线")
+        return True
+    log.error("扫码后 180 秒内仍未上线，请检查手机 QQ 是否点了「授权登录」")
+    return False
+
+
 async def relogin_once(reason: str) -> bool:
     """执行一次自动重登：结束 QQ 进程 → 无黑窗快速登录 → 轮询等待上线。
 
     刻意不接收 ws：本函数会在"主连接已断开"时被调用，必须能独立工作。
     """
-    global relogin_failures
+    global relogin_failures, need_manual_recovery
     log.warning(f"检测到 NapCat 不可用（{reason}），开始自动重登")
 
     # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入
@@ -886,10 +962,15 @@ async def relogin_once(reason: str) -> bool:
             log.info(f"自动重登成功，耗时约 {waited:.0f} 秒")
             relogin_failures = 0
             return True
+
+    # 4) 超时：快速登录多半已被要求扫码，转交人工处理
     log.error(f"自动重登超时（{RELOGIN_WAIT_SECONDS} 秒内未上线），"
-              "可能需要在 QQ 客户端手动扫码登录")
+              "快速登录可能已被要求扫码验证")
     relogin_failures += 1
-    return False
+    if not await handle_scan_login():
+        need_manual_recovery = True
+        return False
+    return True
 
 
 def _spawn_relogin(reason: str) -> None:
@@ -1361,6 +1442,9 @@ async def main():
                  f"离线时自动快速登录（每小时最多 {RELOGIN_MAX_PER_HOUR} 次）")
     relogin_failed = False   # 本轮断开是否已触发过重登（避免重连循环里反复触发）
     while True:
+        if need_manual_recovery:
+            log.warning("已停止 bot：请按提示手动登录以重建快速登录凭证，完成后重新运行 bot.py")
+            return
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
                 log.info("已连接 NapCat，机器人上线喵~")
