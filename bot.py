@@ -957,17 +957,24 @@ async def handle_scan_login() -> bool:
         return True
     scan_prompt_active = True
 
-    log.warning(f"快速登录未成功，需要扫码登录（二维码 {QRCODE_IMAGE}）")
+    log.info("快速登录未成功，需要扫码登录")
 
-    # 1) 先让用户决定：默认手动重建凭证；选择直接扫码时才弹出二维码
-    log.warning("=" * 60)
-    log.warning("快速登录失败 —— 需要扫码登录。请选择：")
-    log.warning("  [Y/回车] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
-    log.warning("            （会结束 NapCat/QQ 进程并停止 bot.py）")
-    log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
-    log.warning("  [N]      就现在扫码登录（需要人工点授权，不支持无人值守）")
-    log.warning("=" * 60)
-    ans = (await asyncio.to_thread(input, "请选择 [Y/n]: ")).strip().lower()
+    # 用 print 而不是 log：log 每行都带"时间戳 [级别]"前缀，会把菜单撑成一堆噪音
+    print()
+    print("=" * 58)
+    print("  快速登录失败，需要扫码登录。请选择：")
+    print()
+    print("   [Y] 先手动登录一次以重建凭证（推荐）")
+    print("       之后掉线可自动快速登录；会结束 NapCat/QQ 并停止 bot.py")
+    print("       注意：若你平时不用 QQ 客户端，重建后仍可能无法自动上线")
+    print()
+    print("   [N] 现在就扫码登录")
+    print("       需要手机 QQ 人工点授权，不支持无人值守")
+    print("=" * 58)
+    print("  回车 = 选 Y")
+    print()
+    ans = (await asyncio.to_thread(input, "  请输入 y 或 n: ")).strip().lower()
+    log.info("扫码流程：用户选择了 %s" % ("Y（手动重建凭证）" if ans in ("", "y", "yes") else "N（直接扫码）"))
 
     if ans in ("", "y", "yes"):
         # 手动恢复：结束进程并停止 bot，让用户登录 QQ 客户端重建凭证（会关闭自动重登）
