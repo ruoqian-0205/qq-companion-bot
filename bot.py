@@ -57,6 +57,11 @@ REPLY_PROBABILITY = CFG["reply_probability"]
 PROACTIVE_INTERVAL_PRIVATE = tuple(CFG["proactive_interval_private"])
 PROACTIVE_INTERVAL_GROUP = tuple(CFG["proactive_interval_group"])
 PROACTIVE_TO_EACH = CFG["proactive_to_each"]
+# 主动消息的"静默期"（秒）：若距离上次对话不足这么久，就跳过本次主动消息，
+# 避免"刚聊完天，机器人又冒一句"的出戏情况。私聊/群聊分开配置，且按会话独立判断。
+# 设为 0 即关闭该机制。
+PROACTIVE_QUIET_PRIVATE = CFG.get("proactive_quiet_private", 60)
+PROACTIVE_QUIET_GROUP = CFG.get("proactive_quiet_group", 300)
 
 MEMORY_MAX_MESSAGES = CFG["memory_max_messages"]
 MEMORY_FILE = CFG["memory_file"]
@@ -152,6 +157,10 @@ group_active_until: dict[int, float] = {}
 
 # 群聊连续回复计数：群号 -> 次数
 group_consecutive_replies: dict[int, int] = {}
+
+# 会话最后活动时间：key -> 时间戳，用于主动消息的静默期判断。
+# 注意：机器人自己发出的**主动消息不更新**它，否则机制会把自己永久抑制住。
+last_activity: dict[str, float] = {}
 
 # NapCat API 请求-响应匹配:echo -> asyncio.Future
 pending_actions: dict[str, asyncio.Future] = {}
@@ -817,8 +826,9 @@ async def proactive_chat(msgs: list[dict]) -> str | None:
     msgs = list(msgs)
     msgs.append({"role": "user",
                  "content": f"【当前时间】北京时间 {now_str}\n"
-                            "（现在是空闲时间，你心血来潮想主动说句话。"
-                            "说一句简短、自然、贴合人设的开场白，不要提到'自动'或'机器人'）"})
+                            "（现在没在和人对话，你想再跟对方说句话。"
+                            "说一句简短、自然、贴合人设的话，像随手发条 QQ 消息；"
+                            "不要长篇大论，也不要提到'自动'或'机器人'）"})
     try:
         resp = await client.chat.completions.create(
             model=TEXT_MODEL,
@@ -831,6 +841,18 @@ async def proactive_chat(msgs: list[dict]) -> str | None:
     except Exception as e:
         log.error(f"主动消息生成失败: {e}")
         return None
+
+
+def is_quiet_period(key: str, quiet_seconds: float) -> tuple[bool, float]:
+    """判断某会话是否处于"刚聊过天"的静默期。
+
+    返回 (是否静默, 空闲秒数)。quiet_seconds <= 0 表示关闭该机制。
+    抽成纯函数是为了可单独验证，同时供私聊/群聊两个循环共用。
+    """
+    if quiet_seconds <= 0:
+        return False, 0.0
+    idle = time.time() - last_activity.get(key, 0)
+    return idle < quiet_seconds, idle
 
 # ---------- 消息解析 ----------
 def extract_message(raw) -> tuple[str, list[dict]]:
@@ -901,6 +923,11 @@ async def handle_message(ws, data: dict):
 
     if not text and not images:
         return
+
+    # 记录会话活动时间：只要对方发来消息（哪怕之后不回复），就算"正在聊天"。
+    # 主动消息的静默期判断依赖它，所以更新放在可能 return 的图片处理之前。
+    _act_key = str(uid) if mtype == "private" else f"g:{data.get('group_id')}"
+    last_activity[_act_key] = time.time()
 
     # 处理图片：识别并标记类型
     image_desc = ""
@@ -1025,6 +1052,11 @@ async def proactive_loop_private(ws):
             if random.random() > PROACTIVE_TO_EACH:
                 continue
             key = str(uid)
+            # 静默期：对方最近还在聊天就不主动打扰（按好友独立判断）
+            quiet, idle = is_quiet_period(key, PROACTIVE_QUIET_PRIVATE)
+            if quiet:
+                log.info(f"私聊 {uid} 最近 {idle:.0f} 秒内有对话，跳过本次主动消息")
+                continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
             reply = await proactive_chat(reply_msgs)
@@ -1050,6 +1082,11 @@ async def proactive_loop_group(ws):
             if random.random() > PROACTIVE_TO_EACH:
                 continue
             key = f"g:{gid}"
+            # 静默期：群里最近还在聊天就不主动插话（按群独立判断）
+            quiet, idle = is_quiet_period(key, PROACTIVE_QUIET_GROUP)
+            if quiet:
+                log.info(f"群 {gid} 最近 {idle:.0f} 秒内有对话，跳过本次主动消息")
+                continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
             reply = await proactive_chat(reply_msgs)

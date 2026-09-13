@@ -29,6 +29,8 @@
   "proactive_interval_private": [1800, 7200],
   "proactive_interval_group": [10800, 21600],
   "proactive_to_each": 0.5,
+  "proactive_quiet_private": 60,
+  "proactive_quiet_group": 300,
 
   "memory_max_messages": 40,
   "memory_file": "memory.json",
