@@ -82,6 +82,12 @@ QRCONSOLE_LOG = CFG.get("qrconsole_log") or os.path.join(
 # 触发快速登录后,等待"上线 或 出现新二维码"的窗口(秒)。
 # 快速登录失败时 NapCat 会立刻生成新二维码(实测 0 秒级),无需苦等 90~180 秒。
 QR_DETECT_TIMEOUT = CFG.get("qr_detect_timeout", 20)
+# 扫码选择的最长等待时间(秒)。超时后会先复查一次在线状态:
+#   已上线(可能刚扫完码) → 视作"选 N"继续运行
+#   仍离线(无人值守)     → 按默认 Y 处理:清理 QQ/NapCat 进程并安全退出,
+#                          避免主循环卡死、进程一直占着登录会话
+# 设为 0 表示永远等待(纯人工值守时可用)。
+SCAN_PROMPT_TIMEOUT = CFG.get("scan_prompt_timeout", 300)
 # 停止 bot.py 时是否一并结束 QQ / NapCat 进程。
 # 默认 true：否则 Ctrl+C 之后 NapCat 与 QQ 会继续在后台占着内存和登录状态。
 KILL_QQ_ON_EXIT = CFG.get("kill_qq_on_exit", True)
@@ -313,6 +319,40 @@ def load_memory():
 def save_memory():
     _atomic_write_json(MEMORY_FILE, memories)
 
+def _clean_l1_facts(raw) -> list[dict]:
+    """清洗 L1 事实条目，保证字段类型正确。
+
+    为什么需要：`format_l1_block` 会在**每轮私聊消息**里被调用，一旦某条事实的
+    字段类型不对（例如手工编辑 memory_long.json 时把 n 写成字符串），
+    排序时 `-f["n"]` 会抛 TypeError，导致该用户的对话全部失败。
+    这里在载入时就把数据规整好，坏字段直接丢弃而不是带病运行。
+    """
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        t = str(item.get("t") or "").strip()
+        c = str(item.get("c") or "").strip()
+        if t not in LM_TYPE_ORDER or not c:
+            continue
+        seen = str(item.get("seen") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", seen):
+            seen = _today_str()
+        exp = str(item.get("exp") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
+            exp = ""
+        if t != "event":
+            exp = ""
+        try:
+            n = max(1, int(item.get("n") or 1))
+        except (TypeError, ValueError):
+            n = 1
+        out.append({"t": t, "c": c[:200], "seen": seen, "n": n,
+                    "exp": exp, "sensitive": bool(item.get("sensitive"))})
+    return out
+
 def load_long_memory():
     """载入 L1 长期记忆库。缺失或损坏时退化为空库（不会影响主对话）。"""
     global long_memories
@@ -320,11 +360,26 @@ def load_long_memory():
         return
     try:
         with open(LM_FILE, "r", encoding="utf-8") as f:
-            long_memories = json.load(f)
-        if not isinstance(long_memories, dict):
-            long_memories = {}
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
     except (FileNotFoundError, json.JSONDecodeError):
-        long_memories = {}
+        data = {}
+    # 统一清洗字段类型（见 _clean_l1_facts 的说明）
+    long_memories = {}
+    for k, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        facts = _clean_l1_facts(entry.get("facts"))
+        try:
+            version = int(entry.get("version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        long_memories[k] = {
+            "version": version,
+            "updated": str(entry.get("updated") or ""),
+            "facts": facts,
+        }
 
 def save_long_memory():
     _atomic_write_json(LM_FILE, long_memories)
@@ -346,6 +401,8 @@ async def append_memory(key: str, role: str, content: str):
     群聊沿用 memory_max_messages 硬截断；私聊正常交给长期记忆压缩接管窗口长度，
     但保留一个远高于阈值的兜底上限——万一压缩持续失败（如 API 长期故障），
     上下文不会无限膨胀导致每轮请求越来越慢、越来越贵。
+    关闭长期记忆时（LONG_MEMORY_ENABLED=False）私聊回退到 memory_max_messages 截断，
+    否则没有任何机制收口，上下文会无限增长。
     """
     time_str = get_beijing_time_str()
     content = f"[{time_str}] {content}"
@@ -353,7 +410,11 @@ async def append_memory(key: str, role: str, content: str):
     if key.startswith("g:"):
         if len(memories[key]) > MEMORY_MAX_MESSAGES:
             memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
-    elif LONG_MEMORY_ENABLED and len(memories[key]) > LM_L0_HARD_LIMIT:
+    elif not LONG_MEMORY_ENABLED:
+        # 没有长期记忆接管，只能按普通窗口截断（与群聊一致）
+        if len(memories[key]) > MEMORY_MAX_MESSAGES:
+            memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
+    elif len(memories[key]) > LM_L0_HARD_LIMIT:
         # 兜底：正常压缩会在 LM_L0_MAX 就收口，只有压缩持续失败才会走到这里
         keep = LM_L0_HARD_LIMIT
         dropped = len(memories[key]) - keep
@@ -994,15 +1055,39 @@ async def _read_stdin_line() -> str:
     return await asyncio.get_running_loop().run_in_executor(_stdin_pool, sys.stdin.readline)
 
 
-async def handle_scan_login() -> bool:
+async def _read_scan_choice() -> str | None:
+    """读扫码选择，返回 'y' / 'n'；超时或输入不可用（EOF）时返回 None。
+
+    None 的含义是"没能拿到用户的决定"，由调用方决定怎么兜底 ——
+    这样超时处理逻辑与读输入解耦，也便于单独验证。
+    """
+    if SCAN_PROMPT_TIMEOUT > 0:
+        try:
+            line = await asyncio.wait_for(_read_stdin_line(), timeout=SCAN_PROMPT_TIMEOUT)
+        except asyncio.TimeoutError:
+            print()
+            log.warning(f"等待扫码选择超时（{SCAN_PROMPT_TIMEOUT} 秒）")
+            return None
+    else:
+        line = await _read_stdin_line()     # 配置为 0：永远等待（人工值守）
+    if line == "":
+        print()
+        log.warning("标准输入不可读（EOF）——常见于输出被重定向或终端不提供交互输入")
+        return None
+    return line.strip().lower()
+
+
+async def handle_scan_login() -> bool | None:
     """快速登录失败、需要扫码时的处理：弹出二维码并询问用户怎么做。
 
-    返回 True  = 代码继续正常运行（用户选择直接扫码）
-    返回 False = 需要停止 bot（用户选择手动重建快速登录凭证）
+    返回 True  = 用户选择直接扫码，且已确认账号上线
+    返回 False = 需要停止 bot（用户选择手动重建凭证 / 超时无人值守 / 扫码未成功）
+    返回 None  = 已经有另一个扫码交互在进行中，本次未完成 —— 调用方不要当成"已完成"
     """
     global scan_prompt_active, need_manual_recovery
     if scan_prompt_active:
-        return True
+        # 不能返回 True：那会让并发进来的调用方误以为"扫码已完成"而继续重连
+        return None
     scan_prompt_active = True
 
     log.warning(f"快速登录未成功，需要扫码登录（二维码 {QRCODE_IMAGE}）")
@@ -1020,8 +1105,18 @@ async def handle_scan_login() -> bool:
     # 手工输出能保证它独占一行、出现在所有日志的最后。
     print()
     print("请选择 [Y/n]: ", end="", flush=True)
-    ans = (await _read_stdin_line()).strip().lower()
-    print()
+    ans = await _read_scan_choice()
+
+    if ans is None:
+        # 超时或没有输入源：先确认是不是用户刚好扫完码（避免把已登录的进程杀掉）
+        if await check_online_standalone():
+            print()
+            log.info("虽然没收到选择，但账号已上线（可能刚扫码成功），继续运行")
+            scan_prompt_active = False
+            return True
+        print()
+        log.warning("超时/无法读取选择，且账号仍离线 → 按默认 Y 处理：清理进程并安全退出")
+        ans = ""
 
     if ans in ("", "y", "yes"):
         # 手动恢复：结束进程并停止 bot，让用户登录 QQ 客户端重建凭证（会关闭自动重登）
@@ -1031,8 +1126,8 @@ async def handle_scan_login() -> bool:
                 subprocess.run(["taskkill", "/f", "/im", img],
                                capture_output=True, text=True,
                                creationflags=subprocess.CREATE_NO_WINDOW)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"结束 {img} 失败：{e}")
         log.warning("处理完毕。请按以下步骤恢复「自动快速登录」：")
         log.warning("  1. 手动启动 NapCat（launcher.bat），在 QQ 客户端里完成登录")
         log.warning("  2. 确认能正常收发消息后，退出 QQ 登录")
@@ -1090,7 +1185,12 @@ async def relogin_once(reason: str) -> bool:
     if result == "qr":
         log.warning("快速登录失败（NapCat 已生成新二维码），转入扫码流程")
         relogin_failures += 1
-        if not await handle_scan_login():
+        scan_result = await handle_scan_login()
+        if scan_result is None:
+            # 另一个扫码交互在进行中（并发调用），本次不视为完成、也不终止流程
+            log.info("已有扫码交互在进行中，本次等待其结束")
+            return True
+        if not scan_result:
             need_manual_recovery = True
             return False
         return True
@@ -1658,10 +1758,16 @@ async def main():
                         elif result == "qr":
                             # 快速登录失败：NapCat 已生成新二维码，立刻转入扫码流程
                             log.warning("快速登录失败（已生成新二维码），转入扫码登录")
-                            if not await handle_scan_login():
+                            scan_result = await handle_scan_login()
+                            if scan_result is None:
+                                # 另一个扫码交互在进行中；不要当成"已停止"直接退出，
+                                # 继续重连循环，等那边完成后自然恢复
+                                log.info("已有扫码交互在进行中，等待其结束")
+                            elif not scan_result:
                                 log.warning("已停止 bot，请按提示手动重建快速登录凭证")
                                 return
-                            log.info("扫码完成，即将重连")
+                            else:
+                                log.info("扫码完成，即将重连")
                         else:
                             log.warning(f"{QR_DETECT_TIMEOUT} 秒内未见上线或新二维码，继续等待 ...")
                             if await wait_online_recovery(RELOGIN_WAIT_SECONDS, 10):
