@@ -973,18 +973,22 @@ async def handle_scan_login() -> bool:
     print("   [N] 现在就扫码登录")
     print("       需要手机 QQ 人工点授权，不支持无人值守")
     print("=" * 58)
-    print("  回车 = 选 Y")
     print()
-    # 读取选择期间临时静音日志：日志走 stderr、菜单走 stdout，
-    # 两者交错会把提示符和菜单冲散。这里短暂摘掉 root 的 handlers 实现静音，
-    # 读完立刻恢复（日志本身不会丢失，只是这几秒不输出）。
-    # 注意：不能用 logger.addFilter —— filter 对子 logger 传播上来的记录不生效。
+    # 提示符放在菜单最后一行：光标就在提示符后面，不会被日志行在视觉上挤走。
+    # 读取期间临时摘掉 root 的 handlers 静音日志，避免菜单被日志冲散
+    # （注意：不能用 logger.addFilter —— filter 对子 logger 传播上来的记录不生效）。
+    # input 走 to_thread 并加超时：万一终端不响应（IDE 捕获 stdin 等），
+    # 也不会永久卡死，而是按默认值 Y 继续。
     _saved_handlers = logging.getLogger().handlers[:]
     logging.getLogger().handlers = []
     try:
-        sys.stdout.write("  请输入 y 或 n: ")
+        sys.stdout.write("  回车 = 选 Y；请输入 y 或 n: ")
         sys.stdout.flush()
-        ans = (await asyncio.to_thread(input)).strip().lower()
+        try:
+            ans = (await asyncio.wait_for(asyncio.to_thread(input), timeout=180)).strip().lower()
+        except asyncio.TimeoutError:
+            log.warning("等待选择超时（180 秒），按默认 Y 处理")
+            ans = ""
     finally:
         logging.getLogger().handlers = _saved_handlers
     print()
@@ -996,7 +1000,7 @@ async def handle_scan_login() -> bool:
         for img in ("QQ.exe", "NapCatWinBootMain.exe"):
             try:
                 subprocess.run(["taskkill", "/f", "/im", img],
-                               capture_output=True, text=True,
+                               capture_output=True, text=True, timeout=10,
                                creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception:
                 pass
@@ -1029,7 +1033,7 @@ async def relogin_once(reason: str) -> bool:
     # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入
     try:
         r = subprocess.run(["taskkill", "/f", "/im", "QQ.exe"],
-                           capture_output=True, text=True,
+                           capture_output=True, text=True, timeout=10,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         log.info(f"已结束 QQ.exe：{(r.stdout or r.stderr or '').strip()[:120]}")
     except Exception as e:
@@ -1547,7 +1551,7 @@ def clean_shutdown(force: bool = False) -> None:
     for img in ("QQ.exe", "NapCatWinBootMain.exe"):
         try:
             r = subprocess.run(["taskkill", "/f", "/im", img],
-                               capture_output=True, text=True,
+                               capture_output=True, text=True, timeout=10,
                                creationflags=subprocess.CREATE_NO_WINDOW)
             out = (r.stdout or r.stderr or "").strip()
             if not out or "not found" in out.lower():
