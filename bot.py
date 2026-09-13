@@ -967,7 +967,13 @@ async def handle_scan_login() -> bool:
     log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
     log.warning("  [N]      就现在扫码登录（需要人工点授权，不支持无人值守）")
     log.warning("=" * 60)
-    ans = (await asyncio.to_thread(input, "请选择 [Y/n]: ")).strip().lower()
+    # 提示符用 print 手工输出（而不是 input 的内置 prompt）：
+    # 内置 prompt 会在调用 input 的瞬间输出，容易与随后落下的日志挤在同一行；
+    # 手工输出能保证它独占一行、出现在所有日志的最后。
+    print()
+    print("请选择 [Y/n]: ", end="", flush=True)
+    ans = (await asyncio.to_thread(input)).strip().lower()
+    print()
 
     if ans in ("", "y", "yes"):
         # 手动恢复：结束进程并停止 bot，让用户登录 QQ 客户端重建凭证（会关闭自动重登）
