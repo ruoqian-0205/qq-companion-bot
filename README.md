@@ -223,18 +223,19 @@ QQ 账号被踢下线、或 QQ 进程意外退出时,机器人会**自动把它�
 
 ```bat
 @echo off
-cd /d D:\tools\NapCat
-set NAPCAT_PATCH_PACKAGE=D:\tools\NapCat\qqnt.json
-set NAPCAT_LOAD_PATH=D:\tools\NapCat\loadNapCat.js
-set NAPCAT_INJECT_PATH=D:\tools\NapCat\NapCatWinBootHook.dll
-set NAPCAT_LAUNCHER_PATH=D:\tools\NapCat\NapCatWinBootMain.exe
-set NAPCAT_MAIN_PATH=D:\tools\NapCat\napcat.mjs
-echo (async () =^> {await import("file:///D:/tools/NapCat/napcat.mjs")})() > "D:\tools\NapCat\loadNapCat.js"
-"D:\tools\NapCat\NapCatWinBootMain.exe" "D:\Tencent\QQNT\QQ.exe" "D:\tools\NapCat\NapCatWinBootHook.dll" <机器人QQ号>
+rem 路径需按你的环境修改：<NapCat目录>、<QQ安装目录>
+cd /d <NapCat目录>
+set NAPCAT_PATCH_PACKAGE=<NapCat目录>\qqnt.json
+set NAPCAT_LOAD_PATH=<NapCat目录>\loadNapCat.js
+set NAPCAT_INJECT_PATH=<NapCat目录>\NapCatWinBootHook.dll
+set NAPCAT_LAUNCHER_PATH=<NapCat目录>\NapCatWinBootMain.exe
+set NAPCAT_MAIN_PATH=<NapCat目录>\napcat.mjs
+echo (async () =^> {await import("file:///<NapCat目录>/napcat.mjs")})() > "<NapCat目录>\loadNapCat.js"
+"<NapCat目录>\NapCatWinBootMain.exe" "<QQ安装目录>\QQ.exe" "<NapCat目录>\NapCatWinBootHook.dll" <机器人QQ号>
 exit /b 0
 ```
 
-> ⚠️ 脚本里的**路径和末尾的 QQ 号需要按你的环境修改**(分别是 NapCat 安装目录、QQ 安装路径、机器人 QQ 号)。QQ 号传给 `NapCatWinBootMain.exe` 即触发**快速登录**,失败时仍会退回扫码登录界面。
+> ⚠️ 三处占位符都要按你的环境替换:`<NapCat目录>`(如 `D:\tools\NapCat`)、`<QQ安装目录>`(如 `D:\Tencent\QQNT`)、`<机器人QQ号>`。QQ 号传给 `NapCatWinBootMain.exe` 即触发**快速登录**,失败时仍会退回扫码登录界面。
 
 ### 安全边界
 
