@@ -156,6 +156,12 @@ python bot.py --debug
 | `enable_silent_hours`           | `true`                                              | 是否启用静音时段                     |
 | `silent_hours_start`            | `0`                                                 | 静音时段开始(小时,北京时间)              |
 | `silent_hours_end`              | `10`                                                | 静音时段结束(小时,北京时间)              |
+| `auto_relogin`                  | `true`                                              | 账号掉线时是否自动快速登录(见下方说明)         |
+| `qq_client_path`                | `D:\Tencent\QQNT\QQ.exe`                            | 本机 QQ 客户端路径(快速登录需要)           |
+| `autologin_script`              | `napcat-autologin.bat`                              | 快速登录脚本(相对路径则相对 bot.py 所在目录)    |
+| `health_check_interval`         | `30`                                                | 在线巡检间隔(秒)                     |
+| `relogin_wait_seconds`          | `180`                                               | 触发重登后等待上线的最长时间(秒)            |
+| `relogin_max_per_hour`          | `2`                                                 | 每小时最多自动重登次数(防止被踢时无限重启)       |
 
 ## 🙋 主动消息的"聊天避让"
 
@@ -168,6 +174,49 @@ python bot.py --debug
 - 两个值都设为 `0` 可关闭该机制,退回"到点就发"的行为
 
 跳过时会打一条日志,方便你根据实际体感微调这两个阈值。
+
+## 🔌 掉线自愈(自动快速登录)
+
+QQ 账号被踢下线、或 QQ 进程意外退出时,机器人会**自动把它拉回线上**,无需人工干预。
+
+**原理**:NapCat 是注入进本机 QQ 客户端的(`launcher` 启动 `QQ.exe` 再注入 DLL),所以"让 QQ 重新起来"就等于"让 NapCat 回来"。程序据此分两种情况处理:
+
+| 情况 | 判断依据 | 处理方式 |
+|---|---|---|
+| QQ 进程已死 | NapCat 端口(3001)不在监听 | 直接执行快速登录脚本拉起 QQ |
+| 账号被踢下线 | 端口在监听,但连接被拒/`get_status.online=false` | 先结束 QQ 进程,再执行快速登录重新注入 |
+
+两个触发点:
+- **连接断开**时立即触发(主连接断开就是 NapCat 不可用的最强信号)
+- **每 `health_check_interval` 秒**巡检一次,兜住"连接还在但账号已离线"的情况
+
+**实测效果**:从 `QQ.exe=0`、端口未监听的完全离线状态,到自动恢复上线约 **19 秒**,且**不弹出任何黑窗口**(用 `CREATE_NO_WINDOW` 启动)。
+
+### 快速登录脚本
+
+`napcat-autologin.bat` 是配套的启动脚本,内容等价于 NapCat 自带的 `launcher-user.bat`,只是去掉了末尾的 `pause`(否则自动调用时会一直挂住):
+
+```bat
+@echo off
+cd /d D:\tools\NapCat
+set NAPCAT_PATCH_PACKAGE=D:\tools\NapCat\qqnt.json
+set NAPCAT_LOAD_PATH=D:\tools\NapCat\loadNapCat.js
+set NAPCAT_INJECT_PATH=D:\tools\NapCat\NapCatWinBootHook.dll
+set NAPCAT_LAUNCHER_PATH=D:\tools\NapCat\NapCatWinBootMain.exe
+set NAPCAT_MAIN_PATH=D:\tools\NapCat\napcat.mjs
+echo (async () =^> {await import("file:///D:/tools/NapCat/napcat.mjs")})() > "D:\tools\NapCat\loadNapCat.js"
+"D:\tools\NapCat\NapCatWinBootMain.exe" "D:\Tencent\QQNT\QQ.exe" "D:\tools\NapCat\NapCatWinBootHook.dll" <机器人QQ号>
+exit /b 0
+```
+
+> ⚠️ 脚本里的**路径和末尾的 QQ 号需要按你的环境修改**(分别是 NapCat 安装目录、QQ 安装路径、机器人 QQ 号)。QQ 号传给 `NapCatWinBootMain.exe` 即触发**快速登录**,失败时仍会退回扫码登录界面。
+
+### 安全边界
+
+- **需要重新扫码的情况无法自动恢复**:如果本机快速登录凭证已失效(比如在别处登录过同一个号),脚本会停在扫码界面,程序在 `relogin_wait_seconds` 后放弃并在日志里提示
+- **限流保护**:每小时最多自动重登 `relogin_max_per_hour` 次,失败后按 1/5/15 分钟退避,避免"重启→被踢→再重启"的死循环
+- **管理员权限**:`napcat-autologin.bat` 走的是 `launcher-user.bat` 的逻辑(**不需要管理员**)。若你的环境必须用需要提权的 `launcher.bat`,自动调用时会弹 UAC,无法无人值守
+- 设 `auto_relogin: false` 可完全关闭该功能
 
 ## 💭 关于思考模式(`enable_thinking`)
 

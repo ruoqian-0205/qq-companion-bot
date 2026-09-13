@@ -32,6 +32,13 @@
   "proactive_quiet_private": 60,
   "proactive_quiet_group": 300,
 
+  "auto_relogin": true,
+  "qq_client_path": "D:\\Tencent\\QQNT\\QQ.exe",
+  "autologin_script": "napcat-autologin.bat",
+  "health_check_interval": 30,
+  "relogin_wait_seconds": 180,
+  "relogin_max_per_hour": 2,
+
   "memory_max_messages": 40,
   "memory_file": "memory.json",
   "enable_silent_hours": true,

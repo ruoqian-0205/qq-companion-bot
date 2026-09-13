@@ -14,6 +14,10 @@ memory.json
 memory_long.json
 *.tmp
 
+# 快速登录脚本及其运行日志（含本机路径、机器人 QQ 号，属于本机专属配置）
+napcat-autologin.bat
+napcat-autologin.log
+
 # Python
 __pycache__/
 *.pyc

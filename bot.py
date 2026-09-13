@@ -13,6 +13,8 @@ import os
 from dotenv import load_dotenv
 import uuid
 import base64
+import socket
+import subprocess
 from copy import deepcopy
 
 load_dotenv()   # 读 .env
@@ -62,6 +64,15 @@ PROACTIVE_TO_EACH = CFG["proactive_to_each"]
 # 设为 0 即关闭该机制。
 PROACTIVE_QUIET_PRIVATE = CFG.get("proactive_quiet_private", 60)
 PROACTIVE_QUIET_GROUP = CFG.get("proactive_quiet_group", 300)
+
+# ---- NapCat 掉线自愈 ----
+# 账号被踢下线 / QQ 进程死掉时，自动执行"结束 QQ 进程 → 快速登录"把机器人拉回线上。
+AUTO_RELOGIN = CFG.get("auto_relogin", True)
+QQ_CLIENT_PATH = CFG.get("qq_client_path", r"D:\Tencent\QQNT\QQ.exe")
+AUTOLOGIN_SCRIPT = CFG.get("autologin_script", "napcat-autologin.bat")
+HEALTH_CHECK_INTERVAL = CFG.get("health_check_interval", 30)     # 看门狗巡检间隔（秒）
+RELOGIN_WAIT_SECONDS = CFG.get("relogin_wait_seconds", 180)      # 触发后等待上线的最长时间
+RELOGIN_MAX_PER_HOUR = CFG.get("relogin_max_per_hour", 2)        # 每小时最多自动重登次数
 
 MEMORY_MAX_MESSAGES = CFG["memory_max_messages"]
 MEMORY_FILE = CFG["memory_file"]
@@ -164,6 +175,12 @@ last_activity: dict[str, float] = {}
 
 # NapCat API 请求-响应匹配:echo -> asyncio.Future
 pending_actions: dict[str, asyncio.Future] = {}
+
+# ---------- NapCat 掉线自愈状态 ----------
+is_online = True                 # 缓存的在线状态，由 check_online() 更新
+relogin_task: asyncio.Task | None = None      # 在途的重登任务
+relogin_attempts: list[float] = []            # 最近的重登时间戳，用于限流
+relogin_failures = 0                          # 连续失败次数，用于退避
 
 # ---------- 长期记忆状态 ----------
 # 记忆库：key -> {"version": int, "updated": str, "facts": [ {t,c,seen,exp,n} ]}
@@ -745,6 +762,175 @@ async def call_napcat(ws, action: str, params: dict) -> dict | None:
     finally:
         pending_actions.pop(echo, None)
 
+# ---------- NapCat 掉线自愈 ----------
+# 关键设计：自愈绝不能依赖长连接——QQ 进程一死，WebSocket 立刻断开，
+# 此时若还指望"通过 WebSocket 查询在线状态"，就会陷入死锁式依赖。
+# 因此：连接断开本身就是不可用的最强信号，由重连循环直接触发重登。
+async def check_online(ws) -> bool:
+    """通过已有连接查询账号是否在线。连接异常/超时都视为不在线。"""
+    try:
+        data = await call_napcat(ws, "get_status", {})
+        return bool(data and data.get("online"))
+    except Exception:
+        return False
+
+
+async def check_online_standalone(timeout: float = 8.0) -> bool:
+    """独立检查在线状态：自建一条临时连接，不依赖主循环的 ws。
+
+    用途：重登过程中轮询是否已上线 / 等待重连时判断 NapCat 是否恢复。
+    """
+    try:
+        async with websockets.connect(WS_URL, open_timeout=timeout) as ws:
+            echo = uuid.uuid4().hex
+            await ws.send(json.dumps({"action": "get_status", "params": {}, "echo": echo}))
+            while True:
+                d = json.loads(await asyncio.wait_for(ws.recv(), timeout=timeout))
+                if d.get("echo") == echo:
+                    data = d.get("data") or {}
+                    return bool(data.get("online"))
+    except Exception:
+        return False
+
+
+def napcat_port_open() -> bool:
+    """用纯 TCP 探测 NapCat 的 WebSocket 端口是否在监听（不依赖 WebSocket 协议）。
+
+    用于区分两种情况：
+    - 端口不在监听 → NapCat 进程本身没跑，重启 QQ 也救不回来
+    - 端口在监听但连接被拒/断开 → 很可能是账号掉线导致，值得自动重登
+    """
+    try:
+        host, _, port = WS_URL.split("//")[-1].partition(":")
+        with socket.create_connection((host or "127.0.0.1", int(port or "3001")), timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+async def wait_online_recovery(max_seconds: float = 180.0, interval: float = 10.0) -> bool:
+    """轮询等待 NapCat 恢复可用（独立连接，不依赖主循环）。"""
+    waited = 0.0
+    while waited < max_seconds:
+        await asyncio.sleep(interval)
+        waited += interval
+        if await check_online_standalone():
+            return True
+    return False
+
+
+def _spawn_autologin_sync() -> str:
+    """用 CREATE_NO_WINDOW 启动快速登录脚本。
+
+    为什么同步调用：CREATE_NO_WINDOW 要求 stdio 不能是管道（否则创建进程会失败），
+    所以这里把输出重定向到文件；脚本本身在实测中是秒级返回的，不会长时间阻塞事件循环。
+    """
+    script = AUTOLOGIN_SCRIPT
+    if not os.path.isabs(script):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+    if not os.path.exists(script):
+        return f"快速登录脚本不存在：{script}"
+    if not os.path.exists(QQ_CLIENT_PATH):
+        return f"QQ.exe 路径不存在：{QQ_CLIENT_PATH}（请检查配置 qq_client_path）"
+
+    log_path = os.path.join(os.path.dirname(script), "napcat-autologin.log")
+    with open(log_path, "a", encoding="utf-8", errors="replace") as f:
+        f.write(f"\n=== {get_beijing_time_str()} 触发自动重登 ===\n")
+        f.flush()
+        subprocess.Popen(
+            ["cmd.exe", "/c", script],
+            stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,     # ← 关键：不弹黑窗
+            cwd=os.path.dirname(script),
+        )
+    return ""
+
+
+async def relogin_once(reason: str) -> bool:
+    """执行一次自动重登：结束 QQ 进程 → 无黑窗快速登录 → 轮询等待上线。
+
+    刻意不接收 ws：本函数会在"主连接已断开"时被调用，必须能独立工作。
+    """
+    global relogin_failures
+    log.warning(f"检测到 NapCat 不可用（{reason}），开始自动重登")
+
+    # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入
+    try:
+        r = subprocess.run(["taskkill", "/f", "/im", "QQ.exe"],
+                           capture_output=True, text=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        log.info(f"已结束 QQ.exe：{(r.stdout or r.stderr or '').strip()[:120]}")
+    except Exception as e:
+        log.error(f"结束 QQ.exe 失败：{e}")
+    await asyncio.sleep(3)   # 等进程真正退出，否则 launcher 可能复用旧实例
+
+    # 2) 无黑窗启动快速登录（QQ 号由 napcat-autologin.bat 内部传入）
+    err = await asyncio.to_thread(_spawn_autologin_sync)
+    if err:
+        log.error(f"自动重登无法执行：{err}")
+        relogin_failures += 1
+        return False
+
+    # 3) 用独立连接轮询等待上线
+    waited = 0.0
+    while waited < RELOGIN_WAIT_SECONDS:
+        await asyncio.sleep(5)
+        waited += 5
+        if await check_online_standalone():
+            log.info(f"自动重登成功，耗时约 {waited:.0f} 秒")
+            relogin_failures = 0
+            return True
+    log.error(f"自动重登超时（{RELOGIN_WAIT_SECONDS} 秒内未上线），"
+              "可能需要在 QQ 客户端手动扫码登录")
+    relogin_failures += 1
+    return False
+
+
+def _spawn_relogin(reason: str) -> None:
+    """限流后启动重登任务。被踢下线属于账号侧问题，必须限次，
+    否则会陷入"重启→被踢→再重启"的循环。"""
+    global relogin_task
+    if relogin_task and not relogin_task.done():
+        return
+    now = time.time()
+    # 只保留最近一小时内的尝试记录
+    relogin_attempts[:] = [t for t in relogin_attempts if now - t < 3600]
+    if len(relogin_attempts) >= RELOGIN_MAX_PER_HOUR:
+        log.error(f"一小时内自动重登已达上限 {RELOGIN_MAX_PER_HOUR} 次，暂停自动恢复，"
+                  "请手动检查 QQ 登录状态（可能需要扫码）")
+        return
+    relogin_attempts.append(now)
+
+    task = asyncio.create_task(relogin_once(reason))
+    relogin_task = task
+    task.add_done_callback(lambda _t: globals().update(relogin_task=None))
+
+
+async def relogin_watchdog(ws):
+    """定期巡检账号状态，发现离线就触发自动重登（失败按 1/5/15 分钟退避）。"""
+    global is_online
+    await asyncio.sleep(5)
+    while True:
+        try:
+            online = await check_online(ws)
+            if online != is_online:
+                log.info(f"账号在线状态变化：{is_online} → {online}")
+            is_online = online
+            if not online:
+                if not AUTO_RELOGIN:
+                    log.warning("账号离线，但 auto_relogin 已关闭，不执行自动重登")
+                elif relogin_task and not relogin_task.done():
+                    pass   # 已有重登任务在跑
+                else:
+                    _spawn_relogin("巡检发现离线")
+        except Exception as e:
+            log.error(f"在线状态巡检异常：{e}")
+        # 失败后按 1 / 5 / 15 分钟退避，避免被踢时无限重启
+        if relogin_failures > 0:
+            await asyncio.sleep(min(60 * (5 ** (relogin_failures - 1)), 900))
+        else:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
 # ---------- 图片获取(读 NapCat 本地缓存,绕开腾讯防盗链) ----------
 async def get_image_base64(ws, file_name: str) -> str | None:
     """
@@ -1126,13 +1312,19 @@ async def main():
                  f"每次压缩 {LM_COMPRESS_COUNT} 条，L1 目标 {LM_L1_TARGET_CHARS} 字，"
                  f"存储于 {LM_FILE}")
     log.info(f"正在连接 NapCat: {WS_URL}")
+    if AUTO_RELOGIN:
+        log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"
+                 f"离线时自动快速登录（每小时最多 {RELOGIN_MAX_PER_HOUR} 次）")
+    relogin_failed = False   # 本轮断开是否已触发过重登（避免重连循环里反复触发）
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
                 log.info("已连接 NapCat，机器人上线喵~")
+                relogin_failed = False
                 tasks = [
                     asyncio.create_task(proactive_loop_private(ws)),
-                    asyncio.create_task(proactive_loop_group(ws))
+                    asyncio.create_task(proactive_loop_group(ws)),
+                    asyncio.create_task(relogin_watchdog(ws))
                 ]
                 try:
                     async for raw in ws:
@@ -1149,7 +1341,26 @@ async def main():
                     for t in tasks:
                         t.cancel()
         except Exception as e:
+            # 连接断开 = NapCat 不可用的最强信号（不依赖 WebSocket 自身去检测）
             log.error(f"连接断开: {e}，5秒后重连...")
+            if AUTO_RELOGIN and not relogin_failed:
+                relogin_failed = True
+                if not napcat_port_open():
+                    # NapCat 服务没在跑（QQ 进程已死）。它本身是注入进 QQ 的，
+                    # 所以"拉起 QQ"就能同时把 NapCat 带回来，不需要额外 taskkill。
+                    log.warning("NapCat 端口未监听（QQ 进程可能已退出），尝试直接快速登录拉起")
+                    err = await asyncio.to_thread(_spawn_autologin_sync)
+                    if err:
+                        log.error(f"快速登录无法执行：{err}")
+                    else:
+                        log.info("已触发快速登录，等待 NapCat 恢复（最多 90 秒）...")
+                        if await wait_online_recovery(90, 10):
+                            log.info("NapCat 已恢复，即将重连")
+                        else:
+                            log.error("90 秒内 NapCat 未恢复，请检查 NapCat 与 QQ 登录状态")
+                else:
+                    # 端口在监听但连接被拒 → 多半是账号掉线，走"重启 QQ + 快速登录"
+                    _spawn_relogin("主连接断开")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
