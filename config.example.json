@@ -38,6 +38,7 @@
   "health_check_interval": 30,
   "relogin_wait_seconds": 180,
   "relogin_max_per_hour": 2,
+  "kill_qq_on_exit": true,
 
   "memory_max_messages": 40,
   "memory_file": "memory.json",

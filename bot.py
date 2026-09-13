@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import uuid
 import base64
 import socket
+import atexit
 import subprocess
 from copy import deepcopy
 
@@ -77,6 +78,9 @@ RELOGIN_MAX_PER_HOUR = CFG.get("relogin_max_per_hour", 2)        # 每小时最�
 QRCODE_IMAGE = CFG.get("qrcode_image", r"D:\tools\NapCat\cache\qrcode.png")
 QRCONSOLE_LOG = CFG.get("qrconsole_log") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "napcat-autologin.log")
+# 停止 bot.py 时是否一并结束 QQ / NapCat 进程。
+# 默认 true：否则 Ctrl+C 之后 NapCat 与 QQ 会继续在后台占着内存和登录状态。
+KILL_QQ_ON_EXIT = CFG.get("kill_qq_on_exit", True)
 
 MEMORY_MAX_MESSAGES = CFG["memory_max_messages"]
 MEMORY_FILE = CFG["memory_file"]
@@ -1429,6 +1433,33 @@ async def debug_console():
         print(f"{ROBOT_NAME}: {reply}\n")
 
 # ---------- 主程序 ----------
+def clean_shutdown(force: bool = False) -> None:
+    """停止 bot 时清理 NapCat / QQ 进程。
+
+    不清理的话，Ctrl+C 之后 NapCat 与 QQ 会继续在后台跑（占内存、占着登录状态）。
+    force=True 表示"用户主动要手动重建凭证"场景，无条件清理。
+    由 atexit 注册调用，正常退出与 Ctrl+C 都会执行。
+    """
+    if not force and not KILL_QQ_ON_EXIT:
+        log.info("kill_qq_on_exit 为 false，保留 QQ / NapCat 进程")
+        return
+    log.warning("正在结束 QQ / NapCat 进程 ...")
+    for img in ("QQ.exe", "NapCatWinBootMain.exe"):
+        try:
+            r = subprocess.run(["taskkill", "/f", "/im", img],
+                               capture_output=True, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            out = (r.stdout or r.stderr or "").strip()
+            if not out or "not found" in out.lower():
+                log.info(f"  {img}: 没有正在运行的进程")
+            else:
+                log.info(f"  {img}: 已结束 {out.lower().count('success')} 个进程")
+        except Exception as e:
+            log.error(f"  结束 {img} 失败：{e}")
+    log.info("清理完成。想重新上线请再次运行 python bot.py"
+             "（已配置掉线自愈的话，它会自己快速登录拉起）")
+
+
 async def main():
     load_memory()
     load_long_memory()
@@ -1441,9 +1472,11 @@ async def main():
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"
                  f"离线时自动快速登录（每小时最多 {RELOGIN_MAX_PER_HOUR} 次）")
     relogin_failed = False   # 本轮断开是否已触发过重登（避免重连循环里反复触发）
+    atexit.register(clean_shutdown)    # Ctrl+C 等退出时兜底清理 NapCat / QQ 进程
     while True:
         if need_manual_recovery:
             log.warning("已停止 bot：请按提示手动登录以重建快速登录凭证，完成后重新运行 bot.py")
+            clean_shutdown(force=True)   # 用户要手动重建凭证 → 无条件结束进程
             return
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:

@@ -177,6 +177,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 | `health_check_interval` | `30` | 在线巡检间隔(秒) |
 | `relogin_wait_seconds` | `180` | 触发重登后等待上线的最长时间(秒) |
 | `relogin_max_per_hour` | `2` | 每小时最多自动重登次数 |
+| `kill_qq_on_exit` | `true` | 停止 bot.py 时是否一并结束 QQ / NapCat 进程(见下方说明) |
 | `qrcode_image` | `D:\tools\NapCat\cache\qrcode.png` | 需要扫码时使用的二维码图片路径 |
 | `qrconsole_log` | `napcat-autologin.log` | 快速登录脚本的输出日志(用于提取二维码链接) |
 
@@ -291,6 +292,17 @@ exit /b 0
 - 选 **Y(或回车)**:结束 NapCat/QQ 进程并停止 bot,你手动登录 QQ 客户端重建凭证,之后重新运行 `bot.py` 即恢复无人值守
 
 **安全边界:** 需要扫码时无法自动恢复(账号侧限制);每小时最多重登 `relogin_max_per_hour` 次,失败按 1/5/15 分钟退避,避免"重启→被踢→再重启"死循环;设 `auto_relogin: false` 可关闭。
+
+### 🛑 安全停止
+
+直接关掉 bot.py 的话,**NapCat 和 QQ 会继续留在后台**跑(占内存、占着登录状态)。所以停止时会自动清理:
+
+- **Ctrl+C** 停止 → 通过 `atexit` 钩子结束 `QQ.exe` 与 `NapCatWinBootMain.exe`
+- **扫码流程选 Y** → 无条件清理(因为就是要手动重建凭证)
+- 日志会打印结束了几个进程
+- 不想让它动 QQ 客户端?把 `kill_qq_on_exit` 设为 `false`
+
+下次运行 `python bot.py` 时会自动快速登录重新拉起,无需手动准备。
 
 ### 📬 消息送达保障
 
