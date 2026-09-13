@@ -767,12 +767,18 @@ async def call_napcat(ws, action: str, params: dict) -> dict | None:
 # 此时若还指望"通过 WebSocket 查询在线状态"，就会陷入死锁式依赖。
 # 因此：连接断开本身就是不可用的最强信号，由重连循环直接触发重登。
 async def check_online(ws) -> bool:
-    """通过已有连接查询账号是否在线。连接异常/超时都视为不在线。"""
+    """通过已有连接查询账号是否在线，并刷新全局缓存 is_online。
+
+    连接异常/超时都视为不在线。复用主循环的连接，实测单次约 0.6ms，
+    因此可以在每次生成消息前放心调用。
+    """
+    global is_online
     try:
         data = await call_napcat(ws, "get_status", {})
-        return bool(data and data.get("online"))
+        is_online = bool(data and data.get("online"))
     except Exception:
-        return False
+        is_online = False
+    return is_online
 
 
 async def check_online_standalone(timeout: float = 8.0) -> bool:
@@ -1079,21 +1085,33 @@ def is_mentioned(raw, self_id: int) -> bool:
     return False
 
 # ---------- 发消息 ----------
-async def send_private_msg(ws, uid: int, text: str):
-    await ws.send(json.dumps({"action": "send_private_msg",
-                              "params": {"user_id": uid, "message": text}},
-                             ensure_ascii=False))
+async def send_private_msg(ws, uid: int, text: str) -> bool:
+    """发送私聊消息，返回是否确认送达。
 
-async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None):
+    改用带 echo 的请求-响应模式：只有拿到 NapCat 的 message_id 才算送达成功。
+    改造前是单向发送，发送失败也是静默的——会把没送出去的话写进记忆。
+    """
+    data = await call_napcat(ws, "send_private_msg",
+                             {"user_id": uid, "message": text})
+    if data and data.get("message_id"):
+        return True
+    log.error(f"私聊发送失败 uid={uid} 回执={data} 内容={text[:60]!r}")
+    return False
+
+async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> bool:
+    """发送群聊消息，返回是否确认送达（判定同 send_private_msg）。"""
     if at_qq is not None:
         message = [{"type": "at", "data": {"qq": str(at_qq)}},
                    {"type": "text", "data": {"text": " " + text}}]
     else:
         message = text
-    await ws.send(json.dumps({"action": "send_group_msg",
-                              "params": {"group_id": gid, "message": message}},
-                             ensure_ascii=False))
-    set_group_active(gid)
+    data = await call_napcat(ws, "send_group_msg",
+                             {"group_id": gid, "message": message})
+    if data and data.get("message_id"):
+        set_group_active(gid)
+        return True
+    log.error(f"群消息发送失败 gid={gid} 回执={data} 内容={text[:60]!r}")
+    return False
 
 # ---------- 事件处理 ----------
 async def handle_message(ws, data: dict):
@@ -1167,14 +1185,20 @@ async def handle_message(ws, data: dict):
             log.info(f"私聊跳过回复 {uid}")
             return
 
+        # 生成前在线检查：账号离线时回复必然发不出去，不如不调用模型（省 token，也避免污染记忆）
+        if not await check_online(ws):
+            log.warning(f"账号离线，跳过本次私聊回复 {uid}（不调用模型，不写入记忆）")
+            return
+
         # 阶段 2（无锁）：调用模型。压缩任务此时可以自由读写 memories，不会影响本轮已取好的快照
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
-        # 阶段 3（持锁）：按序落盘回复
-        async with get_mem_lock(key):
-            await append_memory(key, "assistant", reply)
-
-        await send_private_msg(ws, uid, reply)
+        # 阶段 3：先发送、确认送达后才写记忆 —— 送不出去的话不该被当成"已经说过"
+        if await send_private_msg(ws, uid, reply):
+            async with get_mem_lock(key):
+                await append_memory(key, "assistant", reply)
+        else:
+            log.warning(f"私聊回复未送达，不写入记忆（避免后续对话基于未发生的内容）uid={uid}")
 
     else:  # group
         gid = data.get("group_id")
@@ -1206,13 +1230,19 @@ async def handle_message(ws, data: dict):
             group_consecutive_replies[gid] = 0
             return
 
+        # 生成前在线检查（同私聊）
+        if not await check_online(ws):
+            log.warning(f"账号离线，跳过本次群聊回复 {gid}（不调用模型，不写入记忆）")
+            return
+
         group_consecutive_replies[gid] = group_consecutive_replies.get(gid, 0) + 1
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
-        async with get_mem_lock(key):
-            await append_memory(key, "assistant", reply)
-
-        await send_group_msg(ws, gid, reply, at_qq=uid if mentioned else None)
+        if await send_group_msg(ws, gid, reply, at_qq=uid if mentioned else None):
+            async with get_mem_lock(key):
+                await append_memory(key, "assistant", reply)
+        else:
+            log.warning(f"群回复未送达，不写入记忆 gid={gid}")
 
 async def safe_handle_message(ws, data):
     try:
@@ -1243,13 +1273,20 @@ async def proactive_loop_private(ws):
             if quiet:
                 log.info(f"私聊 {uid} 最近 {idle:.0f} 秒内有对话，跳过本次主动消息")
                 continue
+            # 生成前在线检查：离线时主动消息必然发不出去，不该白白调用模型烧 token
+            if not await check_online(ws):
+                log.warning(f"账号离线，跳过本次主动私聊 {uid}（不调用模型）")
+                continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
             reply = await proactive_chat(reply_msgs)
-            if reply:
+            if not reply:
+                continue
+            if await send_private_msg(ws, uid, reply):
                 async with get_mem_lock(key):
                     await append_memory(key, "assistant", reply)
-                await send_private_msg(ws, uid, reply)
+            else:
+                log.warning(f"主动私聊未送达，不写入记忆 uid={uid}")
 
 async def proactive_loop_group(ws):
     await asyncio.sleep(60)
@@ -1273,13 +1310,20 @@ async def proactive_loop_group(ws):
             if quiet:
                 log.info(f"群 {gid} 最近 {idle:.0f} 秒内有对话，跳过本次主动消息")
                 continue
+            # 生成前在线检查（同私聊）
+            if not await check_online(ws):
+                log.warning(f"账号离线，跳过本次主动群聊 {gid}（不调用模型）")
+                continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
             reply = await proactive_chat(reply_msgs)
-            if reply:
+            if not reply:
+                continue
+            if await send_group_msg(ws, gid, reply):
                 async with get_mem_lock(key):
                     await append_memory(key, "assistant", reply)
-                await send_group_msg(ws, gid, reply)
+            else:
+                log.warning(f"主动群聊未送达，不写入记忆 gid={gid}")
 
 # ---------- 调试模式 ----------
 async def debug_console():
