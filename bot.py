@@ -957,50 +957,17 @@ async def handle_scan_login() -> bool:
         return True
     scan_prompt_active = True
 
-    log.info("快速登录未成功，需要扫码登录")
+    log.warning(f"快速登录未成功，需要扫码登录（二维码 {QRCODE_IMAGE}）")
 
-    # 用 print 而不是 log：log 每行都带"时间戳 [级别]"前缀，会把菜单撑成一堆噪音。
-    # 提示符用 sys.stdout.write + flush 手工输出：这样光标停在提示符后面，
-    # 不会被随后落下的日志行挤到行尾（input() 的内置 prompt 在那种情况下会被推走）。
-    print()
-    print("=" * 58)
-    print("  快速登录失败，需要扫码登录。请选择：")
-    print()
-    print("   [Y] 手动登录一次以重建凭证（推荐）")
-    print("       之后掉线可自动快速登录；会结束 NapCat/QQ 并停止 bot.py")
-    print("       注意：若你平时不用 QQ 客户端，重建后仍可能无法自动上线")
-    print()
-    print("   [N] 现在就扫码登录")
-    print("       需要手机 QQ 人工点授权，不支持无人值守")
-    print("=" * 58)
-    print()
-    # 提示符放在菜单最后一行：光标就在提示符后面，不会被日志行在视觉上挤走。
-    # 读取期间临时摘掉 root 的 handlers 静音日志，避免菜单被日志冲散
-    # （注意：不能用 logger.addFilter —— filter 对子 logger 传播上来的记录不生效）。
-    #
-    # 输入读取用 sys.stdin.readline() 而不是 input()：
-    # 1) 能区分“读到空行（用户按了回车）”与“读到 EOF（输入流不可用/被重定向）”
-    # 2) 避免 input() 在个别 IDE / 重定向环境下不返回的问题
-    _saved_handlers = logging.getLogger().handlers[:]
-    logging.getLogger().handlers = []
-    try:
-        sys.stdout.write("  回车 = 选 Y；请输入 y 或 n（若按键无反应，试试切到英文输入法）: ")
-        sys.stdout.flush()
-        try:
-            line = await asyncio.wait_for(asyncio.to_thread(sys.stdin.readline), timeout=180)
-        except asyncio.TimeoutError:
-            line = "\n"
-            log.warning("等待选择超时（180 秒），按默认 Y 处理")
-        if line == "":
-            log.warning("标准输入不可读（EOF）—— 常见于输出被重定向或终端不提供输入，"
-                        "按默认 Y 处理；想直接扫码请改为手工运行 bot.py 并在终端里选择")
-            ans = ""
-        else:
-            ans = line.strip().lower()
-    finally:
-        logging.getLogger().handlers = _saved_handlers
-    print()
-    log.info("扫码流程：用户选择了 %s" % ("Y（手动重建凭证）" if ans in ("", "y", "yes") else "N（直接扫码）"))
+    # 1) 先让用户决定：默认手动重建凭证；选择直接扫码时才弹出二维码
+    log.warning("=" * 60)
+    log.warning("快速登录失败 —— 需要扫码登录。请选择：")
+    log.warning("  [Y/回车] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
+    log.warning("            （会结束 NapCat/QQ 进程并停止 bot.py）")
+    log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
+    log.warning("  [N]      就现在扫码登录（需要人工点授权，不支持无人值守）")
+    log.warning("=" * 60)
+    ans = (await asyncio.to_thread(input, "请选择 [Y/n]: ")).strip().lower()
 
     if ans in ("", "y", "yes"):
         # 手动恢复：结束进程并停止 bot，让用户登录 QQ 客户端重建凭证（会关闭自动重登）
@@ -1008,7 +975,7 @@ async def handle_scan_login() -> bool:
         for img in ("QQ.exe", "NapCatWinBootMain.exe"):
             try:
                 subprocess.run(["taskkill", "/f", "/im", img],
-                               capture_output=True, text=True, timeout=10,
+                               capture_output=True, text=True,
                                creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception:
                 pass
@@ -1041,7 +1008,7 @@ async def relogin_once(reason: str) -> bool:
     # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入
     try:
         r = subprocess.run(["taskkill", "/f", "/im", "QQ.exe"],
-                           capture_output=True, text=True, timeout=10,
+                           capture_output=True, text=True,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         log.info(f"已结束 QQ.exe：{(r.stdout or r.stderr or '').strip()[:120]}")
     except Exception as e:
@@ -1559,7 +1526,7 @@ def clean_shutdown(force: bool = False) -> None:
     for img in ("QQ.exe", "NapCatWinBootMain.exe"):
         try:
             r = subprocess.run(["taskkill", "/f", "/im", img],
-                               capture_output=True, text=True, timeout=10,
+                               capture_output=True, text=True,
                                creationflags=subprocess.CREATE_NO_WINDOW)
             out = (r.stdout or r.stderr or "").strip()
             if not out or "not found" in out.lower():
