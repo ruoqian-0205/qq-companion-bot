@@ -78,6 +78,9 @@ RELOGIN_MAX_PER_HOUR = CFG.get("relogin_max_per_hour", 2)        # 每小时最�
 QRCODE_IMAGE = CFG.get("qrcode_image", r"D:\tools\NapCat\cache\qrcode.png")
 QRCONSOLE_LOG = CFG.get("qrconsole_log") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "napcat-autologin.log")
+# 触发快速登录后,等待"上线 或 出现新二维码"的窗口(秒)。
+# 快速登录失败时 NapCat 会立刻生成新二维码(实测 0 秒级),无需苦等 90~180 秒。
+QR_DETECT_TIMEOUT = CFG.get("qr_detect_timeout", 20)
 # 停止 bot.py 时是否一并结束 QQ / NapCat 进程。
 # 默认 true：否则 Ctrl+C 之后 NapCat 与 QQ 会继续在后台占着内存和登录状态。
 KILL_QQ_ON_EXIT = CFG.get("kill_qq_on_exit", True)
@@ -837,6 +840,34 @@ async def wait_online_recovery(max_seconds: float = 180.0, interval: float = 10.
     return False
 
 
+def qr_file_mtime() -> float:
+    """二维码文件的修改时间；不存在返回 0。用于判断"是否出现了新二维码"。"""
+    try:
+        return os.path.getmtime(QRCODE_IMAGE)
+    except OSError:
+        return 0.0
+
+
+async def wait_online_or_qr(max_seconds: float, initial_mtime: float) -> str:
+    """等"上线"或"出现新二维码"，谁先发生就返回谁。
+
+    快速登录失败是 0 秒级事件：NapCat 会立刻报"登录态已失效"并生成新二维码。
+    因此不必盲等 90~180 秒 —— 检测到新二维码就能马上进入扫码流程。
+
+    返回 "online"（已上线）/ "qr"（需要扫码）/ "timeout"（两者都没等到）。
+    注意用 mtime 比较而不是"文件是否存在"：这个文件往往是上一轮留下的旧图。
+    """
+    waited = 0.0
+    while waited < max_seconds:
+        await asyncio.sleep(2)
+        waited += 2
+        if await check_online_standalone():
+            return "online"
+        if qr_file_mtime() > initial_mtime:
+            return "qr"
+    return "timeout"
+
+
 def _spawn_autologin_sync() -> str:
     """用 CREATE_NO_WINDOW 启动快速登录脚本。
 
@@ -874,6 +905,20 @@ async def handle_scan_login() -> bool:
     if scan_prompt_active:
         return True
     scan_prompt_active = True
+
+    # 0) 确保二维码是"本次"新生成的：旧文件（上一轮扫码留下的）直接清掉再等新的，
+    #    否则会把过期二维码弹给用户，白扫一次。
+    mt = qr_file_mtime()
+    if mt and (time.time() - mt) > 60:
+        log.info("检测到旧的二维码文件，先清掉并等待本次新生成的二维码 ...")
+        try:
+            os.remove(QRCODE_IMAGE)
+        except OSError:
+            pass
+        for _ in range(15):
+            await asyncio.sleep(2)
+            if qr_file_mtime() > 0:
+                break
     log.warning(f"快速登录未成功，进入扫码处理（二维码 {QRCODE_IMAGE}）")
 
     # 1) 把 NapCat 生成的二维码渲染成 HTML（内嵌 base64，单文件即可打开）
@@ -962,6 +1007,9 @@ async def relogin_once(reason: str) -> bool:
         log.error(f"结束 QQ.exe 失败：{e}")
     await asyncio.sleep(3)   # 等进程真正退出，否则 launcher 可能复用旧实例
 
+    # 记下二维码时间戳：之后若它被更新，就说明快速登录失败、NapCat 已改用扫码
+    qr_before = qr_file_mtime()
+
     # 2) 无黑窗启动快速登录（QQ 号由 napcat-autologin.bat 内部传入）
     err = await asyncio.to_thread(_spawn_autologin_sync)
     if err:
@@ -969,17 +1017,28 @@ async def relogin_once(reason: str) -> bool:
         relogin_failures += 1
         return False
 
-    # 3) 用独立连接轮询等待上线
-    waited = 0.0
-    while waited < RELOGIN_WAIT_SECONDS:
-        await asyncio.sleep(5)
-        waited += 5
-        if await check_online_standalone():
-            log.info(f"自动重登成功，耗时约 {waited:.0f} 秒")
-            relogin_failures = 0
-            return True
+    # 3) 等"上线"或"出现新二维码"——后者意味着快速登录已被要求扫码，
+    #    可以立刻转入扫码流程，不必盲等到 RELOGIN_WAIT_SECONDS。
+    result = await wait_online_or_qr(QR_DETECT_TIMEOUT, qr_before)
+    if result == "online":
+        log.info("自动重登成功（快速登录生效）")
+        relogin_failures = 0
+        return True
 
-    # 4) 超时：快速登录多半已被要求扫码，转交人工处理
+    if result == "qr":
+        log.warning("快速登录失败（NapCat 已生成新二维码），转入扫码流程")
+        relogin_failures += 1
+        if not await handle_scan_login():
+            need_manual_recovery = True
+            return False
+        return True
+
+    # 4) 既没上线也没新二维码：再按原逻辑等满剩余时间
+    log.warning(f"{QR_DETECT_TIMEOUT} 秒内未见上线或新二维码，继续等待（最多 {RELOGIN_WAIT_SECONDS} 秒）")
+    if await wait_online_recovery(RELOGIN_WAIT_SECONDS, 10):
+        log.info("自动重登成功")
+        relogin_failures = 0
+        return True
     log.error(f"自动重登超时（{RELOGIN_WAIT_SECONDS} 秒内未上线），"
               "快速登录可能已被要求扫码验证")
     relogin_failures += 1
@@ -1526,17 +1585,25 @@ async def main():
                     if err:
                         log.error(f"快速登录无法执行：{err}")
                     else:
-                        log.info("已触发快速登录，等待 NapCat 恢复（最多 90 秒）...")
-                        if await wait_online_recovery(90, 10):
+                        qr_before = qr_file_mtime()   # 拉起前的二维码时间戳，用于识别新图
+                        log.info(f"已触发快速登录，等待上线或新二维码（最多 {QR_DETECT_TIMEOUT} 秒）...")
+                        result = await wait_online_or_qr(QR_DETECT_TIMEOUT, qr_before)
+                        if result == "online":
                             log.info("NapCat 已恢复，即将重连")
-                        else:
-                            # 快速登录没成功：多半是被要求扫码。
-                            # 这里必须走扫码交互，否则用户只看到一句错误、无从下手。
-                            log.error("90 秒内 NapCat 未恢复，快速登录可能已被要求扫码验证")
+                        elif result == "qr":
+                            # 快速登录失败：NapCat 已生成新二维码，立刻转入扫码流程
+                            log.warning("快速登录失败（已生成新二维码），转入扫码登录")
                             if not await handle_scan_login():
                                 log.warning("已停止 bot，请按提示手动重建快速登录凭证")
                                 return
                             log.info("扫码完成，即将重连")
+                        else:
+                            log.warning(f"{QR_DETECT_TIMEOUT} 秒内未见上线或新二维码，继续等待 ...")
+                            if await wait_online_recovery(RELOGIN_WAIT_SECONDS, 10):
+                                log.info("NapCat 已恢复，即将重连")
+                            else:
+                                log.error(f"{RELOGIN_WAIT_SECONDS} 秒内 NapCat 未恢复，"
+                                          "请检查 NapCat 与 QQ 登录状态")
                 else:
                     # 端口在监听但连接被拒 → 多半是账号掉线，走"重启 QQ + 快速登录"
                     _spawn_relogin("主连接断开")

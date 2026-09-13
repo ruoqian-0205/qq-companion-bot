@@ -39,6 +39,7 @@
   "relogin_wait_seconds": 180,
   "relogin_max_per_hour": 2,
   "kill_qq_on_exit": true,
+  "qr_detect_timeout": 20,
 
   "memory_max_messages": 40,
   "memory_file": "memory.json",
