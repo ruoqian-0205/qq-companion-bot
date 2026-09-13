@@ -189,7 +189,10 @@ is_online = True                 # 缓存的在线状态，由 check_online() �
 relogin_task: asyncio.Task | None = None      # 在途的重登任务
 relogin_attempts: list[float] = []            # 最近的重登时间戳，用于限流
 relogin_failures = 0                          # 连续失败次数，用于退避
-need_manual_recovery = False                  # 用户选择手动重建凭证 → 主循环据此优雅退出
+# 用户主动选择手动重建凭证 → 主循环据此优雅退出（见 main 的停止分支）
+need_manual_recovery = False
+# 扫码交互是否已在进行中（防止主循环与重登任务同时弹二维码）
+scan_prompt_active = False
 
 # ---------- 长期记忆状态 ----------
 # 记忆库：key -> {"version": int, "updated": str, "facts": [ {t,c,seen,exp,n} ]}
@@ -867,6 +870,12 @@ async def handle_scan_login() -> bool:
     返回 True  = 代码继续正常运行（用户选择直接扫码）
     返回 False = 需要停止 bot（用户选择手动重建快速登录凭证）
     """
+    global scan_prompt_active, need_manual_recovery
+    if scan_prompt_active:
+        return True
+    scan_prompt_active = True
+    log.warning(f"快速登录未成功，进入扫码处理（二维码 {QRCODE_IMAGE}）")
+
     # 1) 把 NapCat 生成的二维码渲染成 HTML（内嵌 base64，单文件即可打开）
     url_line = ""
     try:
@@ -922,13 +931,16 @@ async def handle_scan_login() -> bool:
         log.warning("  1. 手动启动 NapCat（launcher.bat），在 QQ 客户端里完成登录")
         log.warning("  2. 确认能正常收发消息后，退出 QQ 登录")
         log.warning("  3. 重新运行 bot.py —— 之后掉线就能自动拉起")
+        scan_prompt_active = False
         return False
 
     log.info("已选择直接扫码登录，请在浏览器中扫码授权；NapCat 上线后会自动继续运行。")
     if await wait_online_recovery(180, 10):
         log.info("扫码登录成功，NapCat 已上线")
+        scan_prompt_active = False
         return True
     log.error("扫码后 180 秒内仍未上线，请检查手机 QQ 是否点了「授权登录」")
+    scan_prompt_active = False
     return False
 
 
@@ -1518,7 +1530,13 @@ async def main():
                         if await wait_online_recovery(90, 10):
                             log.info("NapCat 已恢复，即将重连")
                         else:
-                            log.error("90 秒内 NapCat 未恢复，请检查 NapCat 与 QQ 登录状态")
+                            # 快速登录没成功：多半是被要求扫码。
+                            # 这里必须走扫码交互，否则用户只看到一句错误、无从下手。
+                            log.error("90 秒内 NapCat 未恢复，快速登录可能已被要求扫码验证")
+                            if not await handle_scan_login():
+                                log.warning("已停止 bot，请按提示手动重建快速登录凭证")
+                                return
+                            log.info("扫码完成，即将重连")
                 else:
                     # 端口在监听但连接被拒 → 多半是账号掉线，走"重启 QQ + 快速登录"
                     _spawn_relogin("主连接断开")
