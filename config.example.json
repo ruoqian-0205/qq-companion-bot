@@ -53,9 +53,15 @@
   "lm_l0_max": 160,
   "lm_compress_count": 80,
   "lm_compress_delay": 3,
-  "lm_l1_target_chars": 1000,
-  "lm_l1_accept_chars": 1500,
-  "lm_l1_inject_chars": 2000,
+  "lm_l1_max_facts": 80,
+  "lm_l1_type_quota": {
+    "profile": 18,
+    "preference": 18,
+    "relation": 12,
+    "promise": 12,
+    "event": 20
+  },
+  "lm_l1_inject_hard_limit": 200,
   "lm_l0_hard_limit": 480,
   "lm_thinking": true,
   "lm_max_tokens": 16000,

@@ -109,9 +109,20 @@ LM_FILE = CFG.get("lm_file", "memory_long.json")
 LM_L0_MAX = CFG.get("lm_l0_max", 160)
 LM_COMPRESS_COUNT = CFG.get("lm_compress_count", 80)
 LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
-LM_L1_TARGET_CHARS = CFG.get("lm_l1_target_chars", 1000)
-LM_L1_ACCEPT_CHARS = CFG.get("lm_l1_accept_chars", 1500)
-LM_L1_INJECT_CHARS = CFG.get("lm_l1_inject_chars", 2000)
+# L1 的容量以「条目数」计，不以「字数」计。
+# 为什么改：模型是逐条生成的，"我写了几条"它数得清，"我写了多少字"只能靠猜。
+# 一条事实的 JSON 骨架固定占约 88 字符（t/seen/exp/n/sensitive 这些键名和默认值），
+# 按整段估算会把可用额度算少 7~9 倍（1000 字口径下：按 c 字段算是 50~66 条，按整段 JSON 算只有 7~10 条）。
+# 代码侧的统计口径从来只算 c 字段，和模型的直觉本就不一致——改用条目数后这个歧义从根上消失。
+LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 80)
+# 分类参考上限。作用是"防止某一类把总配额吃光"（接替原来的 LM_TYPE_BUDGET_RATIO），
+# 不是给每类设死数字：整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
+LM_L1_TYPE_QUOTA = CFG.get("lm_l1_type_quota", {
+    "profile": 18, "preference": 18, "relation": 12, "promise": 12, "event": 20,
+})
+# 注入侧不再限制字数（条目数上限已经隐含了成本上限：80 条约 2000 字符）。
+# 这个"保险丝"只在模型异常输出（例如一次返回好几百条）时兜底，正常永远碰不到。
+LM_L1_INJECT_HARD_LIMIT = CFG.get("lm_l1_inject_hard_limit", 200)
 # 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
 # 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
 LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
@@ -358,39 +369,54 @@ def load_memory():
 def save_memory():
     _atomic_write_json(MEMORY_FILE, memories)
 
+def _fact_from_item(item, t_hint: str = "") -> dict | None:
+    """把一条原始条目规整成内部结构，非法则返回 None。
+
+    单条清洗逻辑的唯一实现：载入磁盘数据（_clean_l1_facts）和解析模型输出
+    （parse_l1_facts）都走这里。以前这两处是复制粘贴的同一段代码，改一处漏一处
+    就会造成"磁盘能读、模型输出却被丢"这类很难查的不一致。
+
+    t_hint 供分桶格式使用：桶名即类型，桶内条目不再写 t 字段。
+    """
+    if not isinstance(item, dict):
+        return None
+    t = t_hint or str(item.get("t") or "").strip()
+    c = str(item.get("c") or "").strip()
+    # 旧数据兼容：sensitive 曾是独立类型，现已降级为布尔标记。
+    # 这里必须"转换"而不是"丢弃"——否则文件里残留的旧条目、或从 .bak 恢复出来的数据
+    # 会被静默清掉，而"需要保密的事"恰恰是最不能丢的一类。
+    legacy_sensitive = False
+    if t == "sensitive":
+        t, legacy_sensitive = "profile", True
+    if t not in LM_TYPE_ORDER or not c:
+        return None
+    seen = str(item.get("seen") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", seen):
+        seen = _today_str()
+    exp = str(item.get("exp") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
+        exp = ""
+    if t != "event":
+        exp = ""
+    try:
+        n = max(1, int(item.get("n") or 1))
+    except (TypeError, ValueError):
+        n = 1
+    return {"t": t, "c": c[:200], "seen": seen, "n": n,
+            "exp": exp, "sensitive": bool(item.get("sensitive")) or legacy_sensitive}
+
+
 def _clean_l1_facts(raw) -> list[dict]:
     """清洗 L1 事实条目，保证字段类型正确。
 
     为什么需要：`format_l1_block` 会在**每轮私聊消息**里被调用，一旦某条事实的
     字段类型不对（例如手工编辑 memory_long.json 时把 n 写成字符串），
     排序时 `-f["n"]` 会抛 TypeError，导致该用户的对话全部失败。
-    这里在载入时就把数据规整好，坏字段直接丢弃而不是带病运行。
+    这里在载入时就把数据规整好，坏条目直接丢弃而不是带病运行。
     """
-    out = []
     if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        t = str(item.get("t") or "").strip()
-        c = str(item.get("c") or "").strip()
-        if t not in LM_TYPE_ORDER or not c:
-            continue
-        seen = str(item.get("seen") or "").strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", seen):
-            seen = _today_str()
-        exp = str(item.get("exp") or "").strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
-            exp = ""
-        if t != "event":
-            exp = ""
-        try:
-            n = max(1, int(item.get("n") or 1))
-        except (TypeError, ValueError):
-            n = 1
-        out.append({"t": t, "c": c[:200], "seen": seen, "n": n,
-                    "exp": exp, "sensitive": bool(item.get("sensitive"))})
-    return out
+        return []
+    return [f for f in (_fact_from_item(i) for i in raw) if f]
 
 def load_long_memory():
     """载入 L1 长期记忆库。缺失或损坏时退化为空库（不会影响主对话）。"""
@@ -529,21 +555,53 @@ def build_system_content(key: str) -> str:
     return base
 
 # ---------- 长期记忆：L1 载入/注入 ----------
-LM_TYPE_ORDER = {"profile": 0, "relation": 1, "preference": 2, "sensitive": 3, "promise": 4, "event": 5}
+# 类型顺序同时决定三件事：注入块的分类展示顺序、总量超限时的淘汰优先级、紧凑格式的缩写。
+# 注意 sensitive 已不在其中：它从"类型"降级为布尔标记（任何类型都能打），
+# 这样"需要保密的事"不再单独占一类配额，也不会因为类型归属模糊而在新旧数据之间摇摆。
+LM_TYPE_ORDER = {"profile": 0, "relation": 1, "preference": 2, "promise": 3, "event": 4}
 LM_TYPE_LABEL = {
     "profile": "基本信息",
     "relation": "重要关系",
     "preference": "偏好与雷区",
-    "sensitive": "需要保密的事",
     "promise": "约定与承诺",
     "event": "近期事件",
 }
-LM_TYPE_SHORT = {"profile": "p", "relation": "r", "preference": "f", "sensitive": "s", "promise": "m", "event": "e"}
+LM_TYPE_SHORT = {"profile": "p", "relation": "r", "preference": "f", "promise": "m", "event": "e"}
 LM_SHORT_TYPE = {v: k for k, v in LM_TYPE_SHORT.items()}
 
-# 单类事实在注入块里的占比上限。阈值偏高，只用来兜底防止某一类(如条目最多的 profile)
-# 把整个预算吃光，从而让重要关系/偏好/保密事项整类被挤出去。
-LM_TYPE_BUDGET_RATIO = 0.6
+
+def _format_type_quota() -> str:
+    """生成分类配额的书面写法，供 prompt 和启动日志共用。
+
+    刻意不把配额表写死在 prompt 里：否则以后改类别或调数值时，必然漏改其中一处。
+    """
+    parts = []
+    for t in sorted(LM_TYPE_ORDER, key=lambda x: LM_TYPE_ORDER[x]):
+        q = LM_L1_TYPE_QUOTA.get(t)
+        label = LM_TYPE_LABEL.get(t, t)
+        parts.append(f"{label}({t}) {q} 条" if q else f"{label}({t}) 不限")
+    return "；".join(parts)
+
+
+# 分类配额的合法性校验：宁可不启动，也不要静默丢记忆。
+# （未列出的类型只受整库上限约束，不强制每类都配。）
+if LONG_MEMORY_ENABLED:
+    # 用推导式而不是 for 循环：循环变量不会泄漏到模块命名空间，配额表为空也不会 NameError
+    _quota_problems = [
+        (f"「{_t}」不是合法类型" if _t not in LM_TYPE_ORDER
+         else f"「{_t}」的配额 {_v!r} 必须是正整数")
+        for _t, _v in LM_L1_TYPE_QUOTA.items()
+        if _t not in LM_TYPE_ORDER or isinstance(_v, bool) or not isinstance(_v, int) or _v <= 0
+    ]
+    _quota_sum = sum(
+        v for k, v in LM_L1_TYPE_QUOTA.items()
+        if k in LM_TYPE_ORDER and isinstance(v, int) and not isinstance(v, bool)
+    )
+    if _quota_sum > LM_L1_MAX_FACTS:
+        _quota_problems.append(f"各类配额合计 {_quota_sum} 超过整库上限 {LM_L1_MAX_FACTS}")
+    if _quota_problems:
+        raise SystemExit("配置错误：lm_l1_type_quota 非法 —— " + "；".join(_quota_problems))
+    del _quota_problems, _quota_sum
 
 
 def _now_beijing():
@@ -559,8 +617,8 @@ def format_l1_block(key: str) -> str:
 
     刻意与存储格式分离：磁盘上是结构化条目，注入时是人话短句。
     - 已过期的事件（exp 早于今天）直接过滤掉，纯本地字符串比较，不消耗 token
-    - 按类型优先级 + 最近提及时间排序后截断，保证「基本信息」这类长期事实永远在最前面、
-      不会因为事件条目堆积而被挤出预算
+    - 排序：类型优先级 → 提及次数(n)多 → 最近提及(seen)新
+    - 不再按字数截断：容量改由「条目数配额」在整理时约束，这里只留一根极宽松的保险丝
     """
     entry = long_memories.get(key) or {}
     facts = entry.get("facts") or []
@@ -575,30 +633,32 @@ def format_l1_block(key: str) -> str:
         exp = f.get("exp") or ""
         return not (exp and exp < today)
 
-    # 排序：类型优先级 → 提及次数多 → 最近提及
+    # 排序：类型优先级 → 提及次数(n)多 → 最近提及(seen)新
+    # seen 的降序用"两段式稳定排序"实现：先按日期字符串倒序排一遍，再按 (类型, -n) 排第二遍。
+    # 第二遍是稳定排序，会保留第一遍的日期降序结果。
+    # （不能把 seen 直接塞进同一个元组取负——它是日期字符串，取不了负。）
+    # 注意这里只影响注入块里的展示顺序，不再决定"谁被淘汰"：容量由整理时的配额约束。
     ordered = sorted(
         [f for f in facts if usable(f)],
-        key=lambda f: (
-            LM_TYPE_ORDER.get(f.get("t", ""), 9),
-            -f.get("n", 1),
-            str(f.get("seen") or ""),
-        ),
+        key=lambda f: str(f.get("seen") or ""),
+        reverse=True,
     )
+    ordered.sort(key=lambda f: (LM_TYPE_ORDER.get(f.get("t", ""), 9), -f.get("n", 1)))
 
     groups: dict[str, list[str]] = {}
-    total = 0
+    kept = 0
     for f in ordered:
+        # 保险丝：正常配置（L1 上限 80 条）永远碰不到，只在模型异常输出几百条时兜底，
+        # 免得异常数据把每轮请求的上下文撑爆。这里静默截断，告警由 compress_memory 在
+        # 整理完成时打一次——本函数每轮私聊都会调用，在这里打日志会刷屏。
+        if kept >= LM_L1_INJECT_HARD_LIMIT:
+            break
         t = f.get("t", "")
         line = f"- {f['c']}"
         if f.get("sensitive"):
             line += "（对方要求保密，别主动提起）"
-        if total + len(line) > LM_L1_INJECT_CHARS:
-            break
-        # 单类占比上限：避免"基本信息"条目过多时把重要关系/偏好整类挤出去
-        if sum(len(x) + 1 for x in groups.get(t, [])) + len(line) > LM_L1_INJECT_CHARS * LM_TYPE_BUDGET_RATIO:
-            continue
         groups.setdefault(t, []).append(line)
-        total += len(line) + 1
+        kept += 1
 
     if not groups:
         return ""
@@ -643,34 +703,68 @@ def format_l0_for_compression(segment: list[dict]) -> str:
     return "\n".join(lines)
 
 
-LM_COMPRESS_SYSTEM = """你是长期记忆整理器，负责把「现有记忆库」与「新对话片段」合并成一份新的记忆库。
+# 整理 prompt 模板：{max_facts} / {type_quota} 由下面用 replace 填充。
+# 不能用 str.format —— 正文里有 {"profile":[...]} 这样的字面 JSON 花括号，format 会直接 KeyError。
+# 填充在模块加载时完成一次，之后 system 前缀固定不变，有利于 prompt 命中缓存（成本差约 50 倍）。
+LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现有记忆库」与「新对话片段」合并成一份新的记忆库。
 只输出 JSON，不要任何解释、不要 markdown 代码块。
 
 抽取规则：
 1. 只抽取关于「对方」（正在和你聊天的这个人）的事实，不要抽取寒暄和客套话。
 2. 严禁记录任何关于你自己身份/属性的内容；凡涉及"你是不是AI/机器人/程序/模型"之类的话题，一律跳过。
 3. 保留具体专有信息：人名、昵称、地名、日期、数字、物品名。宁可句子略长，也不要丢掉这些细节。
-4. 合并重复项；同一件事信息有冲突时，以新片段里的为准（旧的直接丢弃）。
-5. 特别注意「状态会被新信息取代」的情况：如果新片段说明某个旧事实已经改变（例如从杭州搬到上海、换了工作、分手了、猫送人了），必须把旧的那条删掉或改写成"从X变成Y"，绝不能旧的状态和新状态同时留着，否则会自相矛盾。
-6. 对方明确要求保密、或属于隐私的事，用 sensitive 类型，并置 "sensitive": true。
+4. 合并重复项：同一件事被反复提到时合并成一条，把次数累加上去（旧条目 n=3、本轮又提到 1 次，新条目就是 n=4）。
+5. 状态会被新信息取代：如果新片段说明某个旧事实已经改变（例如从杭州搬到上海、换了工作、分手了、猫送人了），必须把旧的那条删掉或改写成"从X变成Y"，绝不能旧状态和新状态同时留着，否则会自相矛盾。
+6. 对方明确要求保密、或属于隐私的事，把 sensitive 置为 true；但类型仍按内容本身来选，sensitive 只是标记，不是类型。
 7. 只处理标记为「对方：」的内容。
 
-记忆类型：
+记忆类型（只能用这 5 个）：
 - profile：对方的基本信息（名字、年龄、城市、职业、学业、生活习惯等）
-- preference：喜好与厌恶（喜欢/讨厌什么、雷区）
 - relation：对方生活中的重要关系与宠物
+- preference：喜好与厌恶（喜欢/讨厌什么、雷区）
 - promise：双方约定、答应过的事
-- event：对方提到的一次性事件（考试、旅行、面试等），带日期
-- sensitive：对方明确要求保密或敏感的私事
+- event：对方提到的一次性事件（考试、旅行、面试等），必须填 exp 预计结束日期
 
-输出格式（严格按此结构）：
-{"facts":[{"t":"profile","c":"名字叫阿哲","seen":"2026-09-12","exp":"","n":1,"sensitive":false}]}
-字段：t=类型枚举；c=一句话内容（不超过40字）；seen=该事实最近提及日期 YYYY-MM-DD；exp=仅 event 填预计结束日期，没有就留空串；n=该事实累计出现次数；sensitive=是否敏感布尔值。
+容量与取舍：
+整库上限 {max_facts} 条；各类型参考上限：{type_quota}。
+这是「上限」不是「目标」：没到上限不要凑数，更不许编造。
+
+只有这三种情况允许删除已有条目：
+① 被新片段取代（见规则 5）。
+② 整库超过 {max_facts} 条时，先删"超出自身参考上限"的那一类，规则是——
+   · event：先删 exp 早于今天的，再删 seen 最早的；
+   · 其他类型：先删 n 最小的，n 相同时删 seen 最早的；
+     n 和 seen 都相同时，才由你判断哪条更实质、更该留。
+   注意：基本信息、关系、偏好、约定这几类不会因为"很久没提到"而失去价值，别把 seen 当主要依据。
+③ 同一件事的重复条目：合并成一条（见规则 4）。
+
+绝不允许：
+· 因为"本轮新片段没有新信息"就删除任何条目 —— 没有新信息时，把现有记忆库原样输出；
+· 删除带 sensitive 标记的条目（除非被新信息取代）；
+· 删除对方的身份锚点：名字、城市、职业、学业；
+· 把同一条事实同时放进两个类型。
+
+准确优先于数量：配额冲突时宁可略超上限，也不要丢信息。
+每条事实的 c 字段不超过 40 字。
+
+输出格式（按类型分桶，桶名就是类型，桶内不要再写 t 字段）：
+{"profile":[{"c":"名字叫阿哲","seen":"2026-09-12","n":2}],
+ "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}]}
+字段：c=一句话内容（不超过40字）；seen=该事实最近提及日期 YYYY-MM-DD；
+exp=仅 event 填预计结束日期，没有就整条省略该字段；n=该事实累计出现次数；
+sensitive=只有需要保密时才写 true，否则整个字段省略。
+空桶直接省略，不要写空数组；桶的排列顺序固定为：profile、relation、preference、promise、event。
 
 另外，「现有记忆库」用紧凑单行格式给你，字段依次是：
-  类型缩写|内容|最近提及日期[|exp到期日][|n出现次数][|敏感]
-类型缩写对应：p=profile、r=relation、f=preference、m=promise、e=event、s=sensitive。
-你的输出必须仍然使用上面的 JSON 格式，不要沿用紧凑格式。"""
+  类型缩写|内容|最近提及日期|n出现次数[|exp到期日][|敏感]
+类型缩写对应：p=profile、r=relation、f=preference、m=promise、e=event。
+你的输出必须用上面的分桶 JSON 格式，不要沿用紧凑格式。"""
+
+LM_COMPRESS_SYSTEM = (
+    LM_COMPRESS_SYSTEM_TEMPLATE
+    .replace("{max_facts}", str(LM_L1_MAX_FACTS))
+    .replace("{type_quota}", _format_type_quota())
+)
 
 
 async def memory_llm(system: str, user: str) -> str | None:
@@ -712,7 +806,15 @@ async def memory_llm(system: str, user: str) -> str | None:
 
 
 def parse_l1_facts(raw: str) -> list[dict] | None:
-    """解析压缩模型返回的事实数组，任何异常都返回 None（由调用方放弃本次压缩、下轮重试）。"""
+    """解析压缩模型返回的事实库，任何异常都返回 None（由调用方放弃本次压缩、下轮重试）。
+
+    模型按「类型分桶」输出，桶名即类型，桶内条目不再写 t 字段：
+        {"profile":[{"c":"名字叫阿哲","seen":"2026-09-12","n":2}],
+         "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}]}
+    分桶的原因：让模型能直接数出每类有几条。它数得清条目、数不清字数，
+    而"以为字数额度不够"正是上次把整库删空的诱因之一。
+    空桶可以省略；同时兼容旧的扁平 {"facts":[...]} 格式，以防模型偶尔退化回旧写法。
+    """
     text = raw.strip()
     if text.startswith("```"):  # 容错：去掉可能的代码块围栏
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
@@ -722,34 +824,36 @@ def parse_l1_facts(raw: str) -> list[dict] | None:
     except json.JSONDecodeError:
         log.warning(f"长期记忆：压缩结果不是合法 JSON，本次跳过（前 120 字）：{raw[:120]}")
         return None
-
-    raw_facts = data.get("facts") if isinstance(data, dict) else None
-    if not isinstance(raw_facts, list):
-        log.warning("长期记忆：压缩结果缺少 facts 数组，本次跳过")
+    if not isinstance(data, dict):
+        log.warning(f"长期记忆：压缩结果的顶层不是对象（{type(data).__name__}），本次跳过")
         return None
 
-    facts = []
-    for item in raw_facts:
-        if not isinstance(item, dict):
+    facts: list[dict] = []
+    if isinstance(data.get("facts"), list):
+        # 旧扁平格式：类型来自每条自己的 t 字段
+        log.info("长期记忆：模型输出了旧的扁平格式（facts 数组），已按旧格式解析")
+        for item in data["facts"]:
+            f = _fact_from_item(item)
+            if f:
+                facts.append(f)
+        return facts
+
+    # 分桶格式：桶名即类型
+    unknown = [k for k in data if k not in LM_TYPE_ORDER]
+    for bucket, items in data.items():
+        if bucket not in LM_TYPE_ORDER or not isinstance(items, list):
             continue
-        t = str(item.get("t") or "").strip()
-        c = str(item.get("c") or "").strip()
-        if t not in LM_TYPE_ORDER or not c:
-            continue
-        seen = str(item.get("seen") or "").strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", seen):
-            seen = _today_str()
-        exp = str(item.get("exp") or "").strip()
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", exp):
-            exp = ""
-        if t != "event":
-            exp = ""
-        try:
-            n = max(1, int(item.get("n") or 1))
-        except (TypeError, ValueError):
-            n = 1
-        facts.append({"t": t, "c": c[:200], "seen": seen, "n": n,
-                      "exp": exp, "sensitive": bool(item.get("sensitive"))})
+        for item in items:
+            f = _fact_from_item(item, bucket)
+            if f:
+                facts.append(f)
+    if unknown:
+        log.warning(f"长期记忆：压缩结果里出现未知桶 {unknown}，已忽略")
+        if not facts:
+            # 所有桶名都不认 —— 说明模型完全跑偏。
+            # 必须放弃本次压缩：否则会把整库写成一个空记忆库，又是一次空覆盖。
+            log.warning("长期记忆：没有任何可识别的桶，本次跳过")
+            return None
     return facts
 
 
@@ -763,8 +867,9 @@ def format_l1_for_prompt(facts: list[dict]) -> str:
         line = f"{short}|{f.get('c','')}|{f.get('seen','')}"
         if f.get("exp"):
             line += f"|exp{f['exp']}"
-        if f.get("n", 1) > 1:
-            line += f"|n{f['n']}"
+        # 总是输出 n（包括 n=1）：否则模型看不到原始次数，就无法"在原值基础上累加"。
+        # 之前只在 n>1 时才输出，导致 n=1 的条目模型完全看不到次数，累加规则形同虚设。
+        line += f"|n{f.get('n', 1)}"
         if f.get("sensitive"):
             line += "|敏感"
         lines.append(line)
@@ -805,14 +910,19 @@ async def compress_memory(key: str, gen: int) -> None:
 
         # 第二段：锁外调用模型（唯一的长耗时）
         # 顺序刻意把「新片段」放在前面：长上下文里靠后的内容更容易被忽略，
-        # 而本轮真正需要处理的是新信息，旧记忆库只是合并参照物。
+        # 而本轮真正需要处理的是新信息，旧记忆库只是合并的起点。
+        # 今天日期必须给：模型要据此判断 event 的 exp 是否过期，这是它唯一的时间参照。
         user_prompt = (
-            f"【新对话片段】（集中注意力处理这里，其中的新信息必须全部保留）\n{new_text}\n\n"
-            f"【现有记忆库】（作为合并去重的参照，本身不需要复述）\n{format_l1_for_prompt(old_facts)}\n\n"
-            f"请把新片段里的信息合并进记忆库，输出更新后的完整记忆库 JSON。"
-            f"注意：新片段里只要出现关于对方的新信息或状态变化（例如搬了城市、换了工作、"
-            f"宠物生病、新养成的习惯），都必须体现在结果里，一条也不能漏。"
-            f"总字数控制在 {LM_L1_TARGET_CHARS} 字以内。"
+            f"【新对话片段】（集中注意力处理这里）\n{new_text}\n\n"
+            f"【现有记忆库】（这是合并的起点，输出里必须完整体现它的内容）\n"
+            f"{format_l1_for_prompt(old_facts)}\n\n"
+            f"请把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
+            f"- 输出必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
+            f"或整库超上限按规则淘汰的除外）。\n"
+            f"- 新片段里只要出现关于对方的新信息或状态变化（例如搬了城市、换了工作、"
+            f"宠物生病、新养成的习惯），都必须体现在结果里，一条也不能漏。\n"
+            f"- 即使新片段里没有任何新信息，也要把现有记忆库原样输出，绝不能输出空结果。\n"
+            f"- 今天是 {_today_str()}，据此判断 event 的 exp 是否已过期。"
         )
         try:
             raw = await memory_llm(LM_COMPRESS_SYSTEM, user_prompt)
@@ -836,11 +946,27 @@ async def compress_memory(key: str, gen: int) -> None:
                         "已放弃本次覆盖（避免误清空）")
             return
 
-        total_chars = sum(len(f["c"]) for f in facts)
-        if total_chars > LM_L1_ACCEPT_CHARS:
-            # 留有余量：模型很难精确控制字数，超过容差才提示（不强制二次压缩，避免反复重写丢细节）
-            log.warning(f"长期记忆（{key}）压缩后 {total_chars} 字，超过容差 {LM_L1_ACCEPT_CHARS} 字，"
-                        "将依赖注入截断；如持续发生可调小 lm_l1_target_chars")
+        # 检验侧：只统计、只告警，不拒绝也不截断。
+        # 条目数配额靠 prompt 约束模型执行，这里负责让偏差可见——否则模型到底有没有照做，
+        # 外部完全不可知（上一轮"n 到底有没有累加"就是个例子）。
+        type_counts: dict[str, int] = {}
+        for f in facts:
+            type_counts[f["t"]] = type_counts.get(f["t"], 0) + 1
+        over_quota = [f"{t} {c}/{LM_L1_TYPE_QUOTA[t]}" for t, c in type_counts.items()
+                      if t in LM_L1_TYPE_QUOTA and c > LM_L1_TYPE_QUOTA[t]]
+        long_items = sum(1 for f in facts if len(f["c"]) > 50)
+        multi_mentioned = sum(1 for f in facts if f.get("n", 1) > 1)
+        if len(facts) > LM_L1_MAX_FACTS:
+            log.warning(f"长期记忆（{key}）：本次整理出 {len(facts)} 条，超过整库上限 "
+                        f"{LM_L1_MAX_FACTS} 条（配额由模型执行，不会强制截断；持续超限说明 prompt 需要收紧）")
+        if over_quota:
+            log.warning(f"长期记忆（{key}）：分类超限 {'、'.join(over_quota)}")
+        if long_items:
+            log.warning(f"长期记忆（{key}）：{long_items} 条内容超过 50 字，"
+                        "可能存在把多条合并成一条来绕过配额的情况")
+        if len(facts) > LM_L1_INJECT_HARD_LIMIT:
+            log.error(f"长期记忆（{key}）：{len(facts)} 条超过注入保险丝 "
+                      f"{LM_L1_INJECT_HARD_LIMIT} 条，注入时会被截断（疑似模型异常输出）")
 
         # 第三段：锁内原子提交（全程无 await）
         async with get_mem_lock(key):
@@ -855,8 +981,12 @@ async def compress_memory(key: str, gen: int) -> None:
             save_long_memory()                      # 先写 L1
             del memories[key][:seg_len]             # 再裁 L0
             save_memory()
+            detail = "、".join(
+                f"{LM_TYPE_LABEL.get(t, t)} {type_counts[t]}"
+                for t in sorted(type_counts, key=lambda x: LM_TYPE_ORDER.get(x, 9))
+            )
             log.info(f"长期记忆（{key}）已压缩：L0 -{seg_len} 条，现有 {len(memories.get(key, []))} 条；"
-                     f"L1 {len(facts)} 条事实 / {total_chars} 字")
+                     f"L1 共 {len(facts)}/{LM_L1_MAX_FACTS} 条（{detail}），n>1 的 {multi_mentioned} 条")
     except Exception as e:
         # 兜底：任何意外都不能把主对话链路带崩
         compress_scheduled.discard(key)
@@ -1799,9 +1929,8 @@ async def main():
     load_memory()
     load_long_memory()
     if LONG_MEMORY_ENABLED:
-        log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，"
-                 f"每次压缩 {LM_COMPRESS_COUNT} 条，L1 目标 {LM_L1_TARGET_CHARS} 字，"
-                 f"存储于 {LM_FILE}")
+        log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，每次压缩 {LM_COMPRESS_COUNT} 条，"
+                 f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}），存储于 {LM_FILE}")
     log.info(f"正在连接 NapCat: {WS_URL}")
     if AUTO_RELOGIN:
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"
