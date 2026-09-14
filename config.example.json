@@ -55,12 +55,12 @@
   "lm_compress_delay": 3,
   "lm_l1_target_chars": 1000,
   "lm_l1_accept_chars": 1500,
-  "lm_l1_inject_chars": 800,
+  "lm_l1_inject_chars": 2000,
   "lm_l0_hard_limit": 480,
   "lm_thinking": true,
   "lm_max_tokens": 16000,
 
   "split_reply_enabled": true,
-  "split_reply_max": 5,
+  "split_reply_max": 10,
   "split_reply_interval": [0.5, 1.5]
 }

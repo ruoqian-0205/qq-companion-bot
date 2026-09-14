@@ -110,7 +110,7 @@ LM_COMPRESS_COUNT = CFG.get("lm_compress_count", 80)
 LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
 LM_L1_TARGET_CHARS = CFG.get("lm_l1_target_chars", 1000)
 LM_L1_ACCEPT_CHARS = CFG.get("lm_l1_accept_chars", 1500)
-LM_L1_INJECT_CHARS = CFG.get("lm_l1_inject_chars", 800)
+LM_L1_INJECT_CHARS = CFG.get("lm_l1_inject_chars", 2000)
 # 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
 # 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
 LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
@@ -118,7 +118,7 @@ LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
 # ---- 多段回复（模型用空行分隔时，按段依次发送多条消息）----
 # 模型可以用「连续两个换行」把一次回复分成多条短消息，更接近真人在 QQ 上连发几条。
 SPLIT_REPLY_ENABLED = CFG.get("split_reply_enabled", True)
-SPLIT_REPLY_MAX = CFG.get("split_reply_max", 5)                    # 最多拆成几条，超出合并到最后一条
+SPLIT_REPLY_MAX = CFG.get("split_reply_max", 10)                    # 最多拆成几条，超出合并到最后一条
 SPLIT_REPLY_INTERVAL = tuple(CFG.get("split_reply_interval", [0.5, 1.5]))   # 每条之间的随机间隔(秒)
 
 # 记忆整理（压缩）是否开启思考模式。默认跟随全局 enable_thinking。
