@@ -136,12 +136,12 @@ LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
 
 # ---- 近期流水（recent）----
 # 为什么需要这一层：L0 在高密度对话下只覆盖几小时（实测约 100 条/小时，500 条也就 5 小时），
-# 而 facts 只记长期属性，中间"这几天具体发生了什么"没有归宿 —— 于是模型对昨天的事一无所知。
+# 而 facts 只记长期属性，中间"最近聊过些什么"没有归宿 —— 于是模型对昨天的事一无所知。
 # recent 补的就是这一段：按天分组的日常流水，短期待留，过期由代码丢弃。
 # 它与 facts 有两点根本不同：
 #   1. 增量追加：模型只输出"本次新发现的事"，从不重写整份列表 —— 结构上不可能被覆盖；
-#   2. 时效由代码管（按天淘汰 + 条数保护），不依赖模型记得删。
-LM_RECENT_DAYS = CFG.get("lm_recent_days", 3)                # 保留最近几天
+#   2. 时效由代码管（按"记录日"淘汰 + 条数保护），不依赖模型记得删。
+LM_RECENT_DAYS = CFG.get("lm_recent_days", 3)                # 保留最近几个聊过的日子
 LM_RECENT_MAX_ITEMS = CFG.get("lm_recent_max_items", 200)    # 条数保护上限
 # 过期 event 的宽限期。event 的 exp 到期后不立刻删：对方很可能过几天才提起结果
 # （"上周那场考试出分了"），留一段时间等模型把它改写成结果。
@@ -501,29 +501,42 @@ def _clean_recent(raw) -> dict:
 
 
 def _day_cutoff(today: str, keep_days: int) -> str:
-    """算出"保留最近 keep_days 天"的截止日期（早于它的整日该被淘汰）。"""
+    """算出"保留最近 keep_days 个自然日"的截止日期（早于它的整日该被淘汰）。
+
+    现在只被 event 的过期兜底使用；recent 的清理已改按"记录日"，见 _recent_visible_days。
+    """
     return (datetime.strptime(today, "%Y-%m-%d").date()
             - timedelta(days=max(0, keep_days - 1))).isoformat()
 
 
-def _prune_recent(recent: dict, today: str) -> tuple[dict, list[str]]:
-    """按天淘汰 recent：先删超期的整天，再按条数上限从最老的一天整天删。
+def _recent_visible_days(recent: dict) -> list[str]:
+    """返回应保留/注入的 recent 日期键：最近 LM_RECENT_DAYS 个「有记录且非空」的日子。
+
+    和旧版"按自然日算"的区别：自然日会把很久前唯一一次聊天的流水也淘汰掉，
+    低频率聊天时 recent 就彻底清空、忘了上次聊到哪。改成"记录日"（最近 N 个
+    有聊天记录的日子）之后，中间隔多久都不清空。
+    顺带过滤空键——空键不产出内容，却会白占一个名额。
+    """
+    return [d for d in sorted(recent) if recent[d]][-LM_RECENT_DAYS:]
+
+
+def _prune_recent(recent: dict) -> tuple[dict, list[str]]:
+    """按"记录日"淘汰 recent：只保留最近 LM_RECENT_DAYS 个有记录的日子，
+    再按条数上限从最老的一天整天删。
 
     返回 (清理后的 recent, 告警文本列表)。
-    刻意整天删而不是删单条——半天流水比没有更让人困惑，而且按天淘汰才能让
-    "保留最近 N 天"这个语义保持清晰。
+    刻意整天删而不是删单条——半天流水比没有更让人困惑，而且按记录日淘汰
+    才能让"记得上次聊到哪"这个语义保持清晰。
     """
     notes = []
     if not isinstance(recent, dict) or not recent:
         return {}, notes
 
-    # 1) 超期淘汰
-    cutoff = _day_cutoff(today, LM_RECENT_DAYS)
-    expired = sorted(d for d in recent if d < cutoff)
-    for d in expired:
+    # 1) 保留最近 N 个有记录的日子，越界的整天删掉
+    keep = set(_recent_visible_days(recent))
+    for d in sorted(d for d in recent if d not in keep):
         del recent[d]
-    if expired:
-        notes.append(f"recent 淘汰了 {len(expired)} 个过期日（{expired[0]}~{expired[-1]}）")
+        notes.append(f"recent 只保留最近 {LM_RECENT_DAYS} 个聊过的日子，删除更早的 {d}")
 
     # 2) 条数保护：从最老的一天整天删，至少保留最近一天
     total = sum(len(v) for v in recent.values())
@@ -765,7 +778,7 @@ def _today_str() -> str:
 
 
 def format_l1_block(key: str) -> str:
-    """把 L1 渲染成注入主回复的记忆块（长期事实按类型分组 + 最近几天流水）。
+    """把 L1 渲染成注入主回复的记忆块（长期事实按类型分组 + 最近的日常流水）。
 
     刻意与存储格式分离：磁盘上是结构化条目，注入时是人话短句。
     - 已过期的事件（exp 早于今天）直接过滤掉，纯本地字符串比较，不消耗 token
@@ -828,16 +841,14 @@ def format_l1_block(key: str) -> str:
             "不要说“根据我的记忆”，也不要把这些当成本轮对方说的话。\n" + body
         )
 
-    # 最近几天的流水。按日期过滤一次是防"压缩间隔过长"——那种情况下磁盘上还留着
-    # 过期日子，光靠整理时清理不够及时。
-    cutoff = _day_cutoff(today, LM_RECENT_DAYS)
-    lines = [f"- {d[5:]} {c}"
-             for d in sorted(recent) if d >= cutoff
-             for c in recent[d]]
+    # 最近的日常流水。取"最近 N 个有记录的日子"注入，与存储清理共用 _recent_visible_days，
+    # 保证存储留了什么、这里就注入什么，两处口径不会漂移。
+    days = _recent_visible_days(recent)
+    lines = [f"- {d[5:]} {c}" for d in days for c in recent[d]]
     if lines:
         blocks.append(
-            "【最近几天】（只是背景参考，用来避免重复提问、让接话更自然；\n"
-            "涉及长期状态、性格、偏好、约定时一律以上面的【长期记忆】为准，别被这几天的小事带偏）\n"
+            "【最近的日常】（最近聊过的一些事，接话、关心对方时都可以自然带出来；\n"
+            "涉及长期状态、性格、偏好、约定时，以上面的【长期记忆】为准。太久又无关的略过就好。）\n"
             + "\n".join(lines)
         )
 
@@ -919,7 +930,7 @@ LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现�
 - 除此之外一律不记（我随口描述的外部世界、一时情绪或玩笑、一次性的闲聊细节）。
 
 ■ recent_new：近期流水（只给新增的）
-- 它和上面的长期事实是两回事：这里记"最近这几天具体发生了什么"。
+- 它和上面的长期事实是两回事：这里记"最近聊过的一些日常"。
 - 记什么：对方日常里**有具体内容**的事——吃了什么、去了哪、做了什么、心情如何、身体怎样。
 - 不记什么：寒暄、纯情绪表达、以及「最近已记的流水」里已经有的条目。
 - 每条不超过 30 字，写成客观陈述（"晚上点了猪脚饭"），不要写成对话。
@@ -1292,7 +1303,7 @@ async def compress_memory(key: str, gen: int) -> None:
                 log.info(f"长期记忆（{key}）压缩结果已作废：期间执行过清空记忆")
                 return
 
-            # recent 增量合并：模型只给新增的，代码负责追加、去重与按天淘汰。
+            # recent 增量合并：模型只给新增的，代码负责追加、去重与按记录日淘汰。
             # 正因为它从不被"整体重写"，结构上就不存在被模型误删的可能——
             # 这是 recent 与 facts 最根本的区别。
             cur_recent = deepcopy((long_memories.get(key) or {}).get("recent") or {})
@@ -1301,7 +1312,7 @@ async def compress_memory(key: str, gen: int) -> None:
                 for c in items:
                     if c not in bucket:     # 同日去重，挡住相邻两次压缩的重复追加
                         bucket.append(c)
-            cur_recent, prune_notes = _prune_recent(cur_recent, today)
+            cur_recent, prune_notes = _prune_recent(cur_recent)
 
             long_memories[key] = {
                 "version": (long_memories.get(key) or {}).get("version", 0) + 1,
@@ -2266,7 +2277,7 @@ async def main():
     if LONG_MEMORY_ENABLED:
         log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，每次压缩 {LM_COMPRESS_COUNT} 条，"
                  f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}）；"
-                 f"近期流水保留 {LM_RECENT_DAYS} 天 / 最多 {LM_RECENT_MAX_ITEMS} 条，"
+                 f"近期流水保留最近 {LM_RECENT_DAYS} 个聊过的日子 / 最多 {LM_RECENT_MAX_ITEMS} 条，"
                  f"过期事件宽限 {LM_EVENT_EXPIRE_GRACE_DAYS} 天；存储于 {LM_FILE}")
     log.info(f"正在连接 NapCat: {WS_URL}")
     if AUTO_RELOGIN:
