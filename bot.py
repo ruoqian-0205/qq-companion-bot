@@ -1122,6 +1122,31 @@ def format_recent_for_prompt(recent: dict, days: int = 2) -> str:
     return "\n".join(lines) if lines else "（无）"
 
 
+def build_compress_user_prompt(new_text: str, old_facts: list, old_recent: dict) -> str:
+    """组装压缩调用的 user prompt。
+
+    单独抽成函数，是为了让"从日志重建记忆"这类一次性脚本能复用同一条 prompt。
+    在脚本里复制一份的话，以后 prompt 一改必然漏同步——上一版重建脚本就是这么出问题的。
+    """
+    return (
+        f"【新对话片段】（集中注意力处理这里）\n{new_text}\n\n"
+        f"【现有记忆库】（这是合并的起点，输出里必须完整体现它的内容）\n"
+        f"{format_l1_for_prompt(old_facts)}\n\n"
+        f"【最近已记的流水】（下面这些已经记过了，recent_new 里不要再写一遍，"
+        f"只给本次新发现的）\n{format_recent_for_prompt(old_recent)}\n\n"
+        f"请分两部分输出：\n"
+        f"1. 各类型桶：把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
+        f"   - 必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
+        f"或整库超上限按规则淘汰的除外）。\n"
+        f"   - 新片段里的新信息一条都不能漏：关于对方的新情况与状态变化（搬家、换工作、"
+        f"宠物生病、新养成的习惯），以及「我：」里你自己的承诺、表态与相处习惯，"
+        f"还有双方共同建立的约定与习惯。\n"
+        f"   - 即使新片段里没有任何新信息，也要把现有记忆库原样输出，绝不能输出空结果。\n"
+        f"2. recent_new：本次新发现的近期流水（只要新的，不要重复上面已记过的）。\n"
+        f"- 今天是 {_today_str()}，据此判断 event 的 exp 是否已过期。"
+    )
+
+
 async def compress_memory(key: str, gen: int) -> None:
     """压缩一次 L0 → 自更新 L1。
 
@@ -1159,23 +1184,7 @@ async def compress_memory(key: str, gen: int) -> None:
         # 顺序刻意把「新片段」放在前面：长上下文里靠后的内容更容易被忽略，
         # 而本轮真正需要处理的是新信息，旧记忆库只是合并的起点。
         # 今天日期必须给：模型要据此判断 event 的 exp 是否过期，这是它唯一的时间参照。
-        user_prompt = (
-            f"【新对话片段】（集中注意力处理这里）\n{new_text}\n\n"
-            f"【现有记忆库】（这是合并的起点，输出里必须完整体现它的内容）\n"
-            f"{format_l1_for_prompt(old_facts)}\n\n"
-            f"【最近已记的流水】（下面这些已经记过了，recent_new 里不要再写一遍，"
-            f"只给本次新发现的）\n{format_recent_for_prompt(old_recent)}\n\n"
-            f"请分两部分输出：\n"
-            f"1. 各类型桶：把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
-            f"   - 必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
-            f"或整库超上限按规则淘汰的除外）。\n"
-            f"   - 新片段里的新信息一条都不能漏：关于对方的新情况与状态变化（搬家、换工作、"
-            f"宠物生病、新养成的习惯），以及「我：」里你自己的承诺、表态与相处习惯，"
-            f"还有双方共同建立的约定与习惯。\n"
-            f"   - 即使新片段里没有任何新信息，也要把现有记忆库原样输出，绝不能输出空结果。\n"
-            f"2. recent_new：本次新发现的近期流水（只要新的，不要重复上面已记过的）。\n"
-            f"- 今天是 {_today_str()}，据此判断 event 的 exp 是否已过期。"
-        )
+        user_prompt = build_compress_user_prompt(new_text, old_facts, old_recent)
         try:
             raw = await memory_llm(LM_COMPRESS_SYSTEM, user_prompt)
         except Exception as e:
