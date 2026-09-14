@@ -114,18 +114,19 @@ LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
 # 一条事实的 JSON 骨架固定占约 88 字符（t/seen/exp/n/sensitive 这些键名和默认值），
 # 按整段估算会把可用额度算少 7~9 倍（1000 字口径下：按 c 字段算是 50~66 条，按整段 JSON 算只有 7~10 条）。
 # 代码侧的统计口径从来只算 c 字段，和模型的直觉本就不一致——改用条目数后这个歧义从根上消失。
-LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 80)
+LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 100)
 # 分类参考上限。作用是"防止某一类把总配额吃光"（接替原来的 LM_TYPE_BUDGET_RATIO），
 # 不是给每类设死数字：整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
+# 分配的思路是把额度从"时效型/有限型"挤给"累积型"：
+#   event 是一次性事件、过期即淘汰，relation 的项数天然有限 —— 这两类让出额度；
+#   promise / self / shared 会随相处持续累积（实测一天就从 160 条 L0 里抽出
+#   promise 12 条、self 12 条，都最先顶格），又是角色连续性与关系厚度的载体，所以给得最宽。
 LM_L1_TYPE_QUOTA = CFG.get("lm_l1_type_quota", {
-    # 关于对方
-    "profile": 14, "preference": 14, "relation": 10, "promise": 8, "event": 12,
-    # 关于「我」和「我们」：角色连续性的载体——机器人得记得自己许过的诺、
-    # 表明过的立场、以及双方共同养成的相处习惯，否则"陪伴"每轮都从陌生人重新开始。
-    # promise 收窄成"对方许下的承诺"后条数会降，所以配额从 12 调到 8。
-    "self": 10, "shared": 12,
+    "profile": 14, "preference": 14, "relation": 8, "promise": 16, "event": 8,
+    "self": 20, "shared": 20,
 })
-# 注入侧不再限制字数（条目数上限已经隐含了成本上限：80 条约 2000 字符）。
+# 注入侧不再限制字数（条目数上限已经隐含了成本上限：100 条约 2400 字符，
+# 相比 L0 的几百条原始对话只是零头）。
 # 这个"保险丝"只在模型异常输出（例如一次返回好几百条）时兜底，正常永远碰不到。
 LM_L1_INJECT_HARD_LIMIT = CFG.get("lm_l1_inject_hard_limit", 200)
 # 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
