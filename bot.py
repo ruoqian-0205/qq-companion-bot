@@ -13,6 +13,7 @@ import os
 from dotenv import load_dotenv
 import uuid
 import base64
+import shutil
 import socket
 import atexit
 import subprocess
@@ -420,7 +421,21 @@ def load_long_memory():
         }
 
 def save_long_memory():
+    """写盘前轮转一份备份（.bak1 最新，最多保留 3 份）。
+
+    事实库是整体重写的，一旦模型返回异常内容（例如空数组）就会把既有记忆
+    全部覆盖掉，且无法从 git 恢复（该文件被 gitignore）。留备份用于事后找回。
+    """
     _atomic_write_json(LM_FILE, long_memories)
+    try:
+        if os.path.exists(LM_FILE):
+            for i in (2, 1):
+                src, dst = f"{LM_FILE}.bak{i}", f"{LM_FILE}.bak{i + 1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            shutil.copy2(LM_FILE, f"{LM_FILE}.bak1")
+    except Exception as e:
+        log.warning(f"长期记忆备份失败（不影响本次保存）：{e}")
 
 def clear_long_memory(key: str) -> None:
     """彻底忘记某个会话：清 L0、清 L1、让在途压缩作废。调用方需持有该 key 的锁。"""
@@ -810,6 +825,15 @@ async def compress_memory(key: str, gen: int) -> None:
 
         facts = parse_l1_facts(raw)
         if facts is None:
+            return
+
+        # 防护：模型返回空数组时不得覆盖既有记忆。
+        # 事实库是整体重写的，"空结果"会把此前积累长期记忆一次抹掉；
+        # 既有记忆只会被"更完整的整理结果"覆盖，不会被空结果清空。
+        # （真正想清空请用"清空记忆"指令，那条路径是显式且原子的。）
+        if not facts and old_facts:
+            log.warning(f"长期记忆（{key}）：本次整理结果为空，但已有 {len(old_facts)} 条既有事实，"
+                        "已放弃本次覆盖（避免误清空）")
             return
 
         total_chars = sum(len(f["c"]) for f in facts)
