@@ -369,6 +369,19 @@ def load_memory():
 def save_memory():
     _atomic_write_json(MEMORY_FILE, memories)
 
+def _as_bool(v) -> bool:
+    """把模型可能给出的各种"真值写法"归一成 bool。
+
+    单独抽出来是因为 bool("false") == True：模型偶尔把布尔值写成字符串，
+    直接 bool() 会把"不需要保密"误判成"要保密"，注入时就会多出一句错误的保密提示。
+    """
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "是")
+    if v is None:
+        return False
+    return bool(v)
+
+
 def _fact_from_item(item, t_hint: str = "") -> dict | None:
     """把一条原始条目规整成内部结构，非法则返回 None。
 
@@ -403,7 +416,7 @@ def _fact_from_item(item, t_hint: str = "") -> dict | None:
     except (TypeError, ValueError):
         n = 1
     return {"t": t, "c": c[:200], "seen": seen, "n": n,
-            "exp": exp, "sensitive": bool(item.get("sensitive")) or legacy_sensitive}
+            "exp": exp, "sensitive": _as_bool(item.get("sensitive")) or legacy_sensitive}
 
 
 def _clean_l1_facts(raw) -> list[dict]:
@@ -937,13 +950,18 @@ async def compress_memory(key: str, gen: int) -> None:
         if facts is None:
             return
 
-        # 防护：模型返回空数组时不得覆盖既有记忆。
-        # 事实库是整体重写的，"空结果"会把此前积累长期记忆一次抹掉；
-        # 既有记忆只会被"更完整的整理结果"覆盖，不会被空结果清空。
+        # 防护一：空结果一律不提交。
+        # 事实库是整体重写的，"空结果"有两种伤害——覆盖既有记忆；或者旧库本来就空时，
+        # 白删掉 seg_len 条 L0 却什么都没记住（冷启动时最容易撞上）。
+        # 两种情况都直接放弃本次压缩，L0 与 L1 都不动，等下一轮达到阈值再试。
         # （真正想清空请用"清空记忆"指令，那条路径是显式且原子的。）
-        if not facts and old_facts:
-            log.warning(f"长期记忆（{key}）：本次整理结果为空，但已有 {len(old_facts)} 条既有事实，"
-                        "已放弃本次覆盖（避免误清空）")
+        if not facts:
+            if old_facts:
+                log.warning(f"长期记忆（{key}）：本次整理结果为空，但已有 {len(old_facts)} 条既有事实，"
+                            "已放弃本次覆盖（避免误清空）")
+            else:
+                log.warning(f"长期记忆（{key}）：本次整理结果为空，且既有记忆库也是空的，"
+                            "已放弃本次压缩（否则会白删 L0 却什么都没记住）")
             return
 
         # 检验侧：只统计、只告警，不拒绝也不截断。
@@ -967,6 +985,12 @@ async def compress_memory(key: str, gen: int) -> None:
         if len(facts) > LM_L1_INJECT_HARD_LIMIT:
             log.error(f"长期记忆（{key}）：{len(facts)} 条超过注入保险丝 "
                       f"{LM_L1_INJECT_HARD_LIMIT} 条，注入时会被截断（疑似模型异常输出）")
+        # 骤减告警：按规则只有"超容量"或"状态被取代"才允许删条目，
+        # 一次少掉一半以上很可能是模型误删。只告警不拦截——正常路径下也可能是
+        # 模型把大量重复琐事合并了，代码无权替它判断。
+        if old_facts and len(facts) < len(old_facts) * 0.5:
+            log.warning(f"长期记忆（{key}）：本次整理出 {len(facts)} 条，不足既有 {len(old_facts)} 条的一半，"
+                        "疑似误删（仅告警，不拦截；可对比 .bak 备份确认）")
 
         # 第三段：锁内原子提交（全程无 await）
         async with get_mem_lock(key):
