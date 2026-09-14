@@ -55,11 +55,13 @@
   "lm_compress_delay": 3,
   "lm_l1_max_facts": 80,
   "lm_l1_type_quota": {
-    "profile": 18,
-    "preference": 18,
-    "relation": 12,
-    "promise": 12,
-    "event": 20
+    "profile": 14,
+    "preference": 14,
+    "relation": 10,
+    "promise": 8,
+    "event": 12,
+    "self": 10,
+    "shared": 12
   },
   "lm_l1_inject_hard_limit": 200,
   "lm_l0_hard_limit": 480,

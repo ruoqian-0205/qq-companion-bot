@@ -118,7 +118,12 @@ LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 80)
 # 分类参考上限。作用是"防止某一类把总配额吃光"（接替原来的 LM_TYPE_BUDGET_RATIO），
 # 不是给每类设死数字：整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
 LM_L1_TYPE_QUOTA = CFG.get("lm_l1_type_quota", {
-    "profile": 18, "preference": 18, "relation": 12, "promise": 12, "event": 20,
+    # 关于对方
+    "profile": 14, "preference": 14, "relation": 10, "promise": 8, "event": 12,
+    # 关于「我」和「我们」：角色连续性的载体——机器人得记得自己许过的诺、
+    # 表明过的立场、以及双方共同养成的相处习惯，否则"陪伴"每轮都从陌生人重新开始。
+    # promise 收窄成"对方许下的承诺"后条数会降，所以配额从 12 调到 8。
+    "self": 10, "shared": 12,
 })
 # 注入侧不再限制字数（条目数上限已经隐含了成本上限：80 条约 2000 字符）。
 # 这个"保险丝"只在模型异常输出（例如一次返回好几百条）时兜底，正常永远碰不到。
@@ -571,15 +576,25 @@ def build_system_content(key: str) -> str:
 # 类型顺序同时决定三件事：注入块的分类展示顺序、总量超限时的淘汰优先级、紧凑格式的缩写。
 # 注意 sensitive 已不在其中：它从"类型"降级为布尔标记（任何类型都能打），
 # 这样"需要保密的事"不再单独占一类配额，也不会因为类型归属模糊而在新旧数据之间摇摆。
-LM_TYPE_ORDER = {"profile": 0, "relation": 1, "preference": 2, "promise": 3, "event": 4}
+#
+# 前 5 类记的是「对方」，后 2 类记的是「我」和「我们」：
+#   self   = 机器人自己许过的诺、表明过的立场、形成的相处习惯（角色连续性的关键）
+#   shared = 双方共同建立的约定、习惯、经历、相处模式（关系厚度的来源）
+# 没有这两类时，长期记忆只能回答"对方是个什么样的人"，回答不了"我们之间是什么关系"，
+# 于是角色每轮都像第一次见面——这正是加入它们的原因。
+LM_TYPE_ORDER = {"profile": 0, "relation": 1, "preference": 2, "promise": 3,
+                 "event": 4, "self": 5, "shared": 6}
 LM_TYPE_LABEL = {
     "profile": "基本信息",
     "relation": "重要关系",
     "preference": "偏好与雷区",
     "promise": "约定与承诺",
     "event": "近期事件",
+    "self": "我的立场",
+    "shared": "我们之间",
 }
-LM_TYPE_SHORT = {"profile": "p", "relation": "r", "preference": "f", "promise": "m", "event": "e"}
+LM_TYPE_SHORT = {"profile": "p", "relation": "r", "preference": "f", "promise": "m",
+                 "event": "e", "self": "s", "shared": "u"}
 LM_SHORT_TYPE = {v: k for k, v in LM_TYPE_SHORT.items()}
 
 
@@ -689,14 +704,23 @@ def format_l1_block(key: str) -> str:
 
 
 def format_l0_for_compression(segment: list[dict]) -> str:
-    """把待压缩的 L0 片段转成紧凑单行格式。
+    """把待压缩的 L0 片段转成紧凑单行格式，供压缩模型阅读。
 
-    只输出 user 消息：压缩的目标是「记住对方说过什么」，
-    而 assistant 那侧是模型按人设现编的话，混进去会把虚构内容当成用户事实记下来。
+    用户消息和机器人自己的回复**都要**输出，分别标成「对方：」和「我：」。
+
+    为什么不能只喂用户消息（早期版本就是这么做的）：那样只能记住"对方是个什么样的人"，
+    机器人自己许过的诺、表明过的立场、双方共同养成的相处习惯全都留不下来——
+    它不记得自己说过"六点我等你""这话我记死了"，角色就没有连续性，
+    长期陪伴会变成每轮重置的陌生人。
+
+    风险与对策：assistant 那侧是模型按人设现编的，把编造的身世当事实记下来会自我强化
+    （下次它"真的有妈"了）。所以 prompt 里对「我：」的内容设了严格白名单——
+    只记承诺、表态、相处习惯，绝不记编造的身世与外部经历。
     """
     lines = []
     for m in segment:
-        if m.get("role") != "user":
+        role = m.get("role")
+        if role not in ("user", "assistant"):
             continue
         content = str(m.get("content", ""))
         text = content
@@ -712,7 +736,8 @@ def format_l0_for_compression(segment: list[dict]) -> str:
         text = text.replace("\n", " ").strip()
         if not text:
             continue
-        lines.append(f"{seen or '----'} | 对方：{text}")
+        who = "对方" if role == "user" else "我"
+        lines.append(f"{seen or '----'} | {who}：{text}")
     return "\n".join(lines)
 
 
@@ -723,20 +748,28 @@ LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现�
 只输出 JSON，不要任何解释、不要 markdown 代码块。
 
 抽取规则：
-1. 只抽取关于「对方」（正在和你聊天的这个人）的事实，不要抽取寒暄和客套话。
-2. 严禁记录任何关于你自己身份/属性的内容；凡涉及"你是不是AI/机器人/程序/模型"之类的话题，一律跳过。
+1. 新片段里，标记为「对方：」的是对方说的话，标记为「我：」的是你自己说过的话。两边都要整理，但口径不同（见规则 7~10）。
+2. 涉及"你是不是AI/机器人/程序/模型"之类的话题，一律跳过。同时**绝不要记录你的身世与外部经历**（父母、工作、学历、住址、去过哪、见过谁）——那些是你顺着话头编的，一旦记下，下次你会把它当成真的，人设会越漂越远。
 3. 保留具体专有信息：人名、昵称、地名、日期、数字、物品名。宁可句子略长，也不要丢掉这些细节。
 4. 合并重复项：同一件事被反复提到时合并成一条，把次数累加上去（旧条目 n=3、本轮又提到 1 次，新条目就是 n=4）。
 5. 状态会被新信息取代：如果新片段说明某个旧事实已经改变（例如从杭州搬到上海、换了工作、分手了、猫送人了），必须把旧的那条删掉或改写成"从X变成Y"，绝不能旧状态和新状态同时留着，否则会自相矛盾。
 6. 对方明确要求保密、或属于隐私的事，把 sensitive 置为 true；但类型仍按内容本身来选，sensitive 只是标记，不是类型。
-7. 只处理标记为「对方：」的内容。
+7. 「我：」里**只**记这三类，都归到 self：
+   · 我的承诺、我答应过对方的事（例如"我说过六点会等他"）；
+   · 我对这段关系的表态与立场（例如"我说过他是我最重要的人"）；
+   · 我形成的相处习惯与偏好（例如"我喜欢被他叫妹妹""我习惯每晚跟他说晚安"）。
+8. 「我：」里这些一律不记：我编造的身世与外部经历、我随口描述的外部世界、只是一时情绪或玩笑的话、一次性的闲聊细节。
+9. 双方**共同**建立的（共同约定、共同养成的习惯、共同经历、相处模式）归 shared，例如"我们说好每次不知道说什么就加一句喜欢你"。
+10. 归属别弄反：对方许下的承诺归 promise；你自己许下的承诺归 self；双方一起定下的归 shared。
 
-记忆类型（只能用这 5 个）：
+记忆类型（只能用这 7 个）：
 - profile：对方的基本信息（名字、年龄、城市、职业、学业、生活习惯等）
 - relation：对方生活中的重要关系与宠物
-- preference：喜好与厌恶（喜欢/讨厌什么、雷区）
-- promise：双方约定、答应过的事
+- preference：对方的喜好与厌恶（喜欢/讨厌什么、雷区）
+- promise：**对方**许下的承诺、答应过你的事
 - event：对方提到的一次性事件（考试、旅行、面试等），必须填 exp 预计结束日期
+- self：关于「我」（你自己）的：我说过的承诺、表明过的立场、形成的相处习惯与偏好
+- shared：你和对方**共同**建立的：共同约定、共同习惯、共同经历、相处模式
 
 容量与取舍：
 整库上限 {max_facts} 条；各类型参考上限：{type_quota}。
@@ -748,13 +781,15 @@ LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现�
    · event：先删 exp 早于今天的，再删 seen 最早的；
    · 其他类型：先删 n 最小的，n 相同时删 seen 最早的；
      n 和 seen 都相同时，才由你判断哪条更实质、更该留。
-   注意：基本信息、关系、偏好、约定这几类不会因为"很久没提到"而失去价值，别把 seen 当主要依据。
+   注意：基本信息、关系、偏好、约定、我的立场、我们之间这几类不会因为"很久没提到"而失去价值，别把 seen 当主要依据。
 ③ 同一件事的重复条目：合并成一条（见规则 4）。
 
 绝不允许：
 · 因为"本轮新片段没有新信息"就删除任何条目 —— 没有新信息时，把现有记忆库原样输出；
+· 记录你编造的身世与外部经历（父母、工作、学历、住址、去过哪、见过谁）；
 · 删除带 sensitive 标记的条目（除非被新信息取代）；
 · 删除对方的身份锚点：名字、城市、职业、学业；
+· 删除 self / shared 里关于这段关系的关键内容（除非被新信息取代）；
 · 把同一条事实同时放进两个类型。
 
 准确优先于数量：配额冲突时宁可略超上限，也不要丢信息。
@@ -762,15 +797,17 @@ LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现�
 
 输出格式（按类型分桶，桶名就是类型，桶内不要再写 t 字段）：
 {"profile":[{"c":"名字叫阿哲","seen":"2026-09-12","n":2}],
- "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}]}
+ "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}],
+ "self":[{"c":"我说过会一直陪着他","seen":"2026-09-13","n":1}]}
 字段：c=一句话内容（不超过40字）；seen=该事实最近提及日期 YYYY-MM-DD；
 exp=仅 event 填预计结束日期，没有就整条省略该字段；n=该事实累计出现次数；
 sensitive=只有需要保密时才写 true，否则整个字段省略。
-空桶直接省略，不要写空数组；桶的排列顺序固定为：profile、relation、preference、promise、event。
+空桶直接省略，不要写空数组；桶的排列顺序固定为：
+profile、relation、preference、promise、event、self、shared。
 
 另外，「现有记忆库」用紧凑单行格式给你，字段依次是：
   类型缩写|内容|最近提及日期|n出现次数[|exp到期日][|敏感]
-类型缩写对应：p=profile、r=relation、f=preference、m=promise、e=event。
+类型缩写对应：p=profile、r=relation、f=preference、m=promise、e=event、s=self、u=shared。
 你的输出必须用上面的分桶 JSON 格式，不要沿用紧凑格式。"""
 
 LM_COMPRESS_SYSTEM = (
@@ -919,7 +956,7 @@ async def compress_memory(key: str, gen: int) -> None:
 
         new_text = format_l0_for_compression(segment)
         if not new_text.strip():
-            return  # 片段里没有用户消息（例如全是机器人主动发言），没什么可记的
+            return  # 片段里没有任何可读内容（正常情况下不会发生）
 
         # 第二段：锁外调用模型（唯一的长耗时）
         # 顺序刻意把「新片段」放在前面：长上下文里靠后的内容更容易被忽略，
@@ -979,6 +1016,11 @@ async def compress_memory(key: str, gen: int) -> None:
                         f"{LM_L1_MAX_FACTS} 条（配额由模型执行，不会强制截断；持续超限说明 prompt 需要收紧）")
         if over_quota:
             log.warning(f"长期记忆（{key}）：分类超限 {'、'.join(over_quota)}")
+        # 新功能的可观测指标：整库一条 self / shared 都没有，说明模型忽略了「我：」那半段内容。
+        # 条数太少时本来就可能一条都不该抽，所以只在条目够多时提示。
+        if not type_counts.get("self") and not type_counts.get("shared") and len(facts) >= 10:
+            log.warning(f"长期记忆（{key}）：本次 {len(facts)} 条里没有任何 self / shared 条目，"
+                        "可能是模型忽略了「我：」的内容（需观察）")
         if long_items:
             log.warning(f"长期记忆（{key}）：{long_items} 条内容超过 50 字，"
                         "可能存在把多条合并成一条来绕过配额的情况")
