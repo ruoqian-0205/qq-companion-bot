@@ -23,6 +23,10 @@ memory_long.json.*
 napcat-autologin.bat
 napcat-autologin.log
 
+# bot 的错误日志（含 QQ 号与聊天内容片段，务必不要提交）
+bot_error.log
+bot_error.log.*
+
 # 扫码登录时生成的二维码临时页面
 napcat-qrcode.html
 

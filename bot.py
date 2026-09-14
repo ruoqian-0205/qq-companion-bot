@@ -3,6 +3,7 @@ import asyncio
 import json
 import random
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -115,15 +116,15 @@ LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
 # 按整段估算会把可用额度算少 7~9 倍（1000 字口径下：按 c 字段算是 50~66 条，按整段 JSON 算只有 7~10 条）。
 # 代码侧的统计口径从来只算 c 字段，和模型的直觉本就不一致——改用条目数后这个歧义从根上消失。
 LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 100)
-# 分类参考上限。作用是"防止某一类把总配额吃光"（接替原来的 LM_TYPE_BUDGET_RATIO），
-# 不是给每类设死数字：整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
-# 分配的思路是把额度从"时效型/有限型"挤给"累积型"：
-#   event 是一次性事件、过期即淘汰，relation 的项数天然有限 —— 这两类让出额度；
-#   promise / self / shared 会随相处持续累积（实测一天就从 160 条 L0 里抽出
-#   promise 12 条、self 12 条，都最先顶格），又是角色连续性与关系厚度的载体，所以给得最宽。
+# 分类参考上限。作用是"防止某一类把总配额吃光"，不是给每类设死数字：
+# 整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
+# 分配思路：relation 的项数天然有限，让出一点；promise / self / shared 会随相处
+# 持续累积（实测一天就从 160 条 L0 里抽出 promise 12、self 12，都最先顶格），给得宽。
+# event 从 8 提到 14：它的定义已放宽成"有明确时间点的事（过去/未来都算）"，
+# 既要记安排、又要承接已经发生的重要结果，8 条明显不够用。
 LM_L1_TYPE_QUOTA = CFG.get("lm_l1_type_quota", {
-    "profile": 14, "preference": 14, "relation": 8, "promise": 16, "event": 8,
-    "self": 20, "shared": 20,
+    "profile": 14, "preference": 14, "relation": 8, "promise": 14, "event": 14,
+    "self": 18, "shared": 18,
 })
 # 注入侧不再限制字数（条目数上限已经隐含了成本上限：100 条约 2400 字符，
 # 相比 L0 的几百条原始对话只是零头）。
@@ -132,6 +133,20 @@ LM_L1_INJECT_HARD_LIMIT = CFG.get("lm_l1_inject_hard_limit", 200)
 # 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
 # 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
 LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
+
+# ---- 近期流水（recent）----
+# 为什么需要这一层：L0 在高密度对话下只覆盖几小时（实测约 100 条/小时，500 条也就 5 小时），
+# 而 facts 只记长期属性，中间"这几天具体发生了什么"没有归宿 —— 于是模型对昨天的事一无所知。
+# recent 补的就是这一段：按天分组的日常流水，短期待留，过期由代码丢弃。
+# 它与 facts 有两点根本不同：
+#   1. 增量追加：模型只输出"本次新发现的事"，从不重写整份列表 —— 结构上不可能被覆盖；
+#   2. 时效由代码管（按天淘汰 + 条数保护），不依赖模型记得删。
+LM_RECENT_DAYS = CFG.get("lm_recent_days", 3)                # 保留最近几天
+LM_RECENT_MAX_ITEMS = CFG.get("lm_recent_max_items", 200)    # 条数保护上限
+# 过期 event 的宽限期。event 的 exp 到期后不立刻删：对方很可能过几天才提起结果
+# （"上周那场考试出分了"），留一段时间等模型把它改写成结果。
+# 超过这个天数仍没被改写，就由代码直接删掉——它已经不注入了，留着只是白占配额。
+LM_EVENT_EXPIRE_GRACE_DAYS = CFG.get("lm_event_expire_grace_days", 7)
 
 # ---- 多段回复（模型用空行分隔时，按段依次发送多条消息）----
 # 模型可以用「连续两个换行」把一次回复分成多条短消息，更接近真人在 QQ 上连发几条。
@@ -154,6 +169,13 @@ if LONG_MEMORY_ENABLED and not (2 <= LM_COMPRESS_COUNT <= LM_L0_MAX // 2):
         f"配置错误：lm_compress_count({LM_COMPRESS_COUNT}) 必须满足 2 <= 值 <= lm_l0_max/2({LM_L0_MAX // 2})，"
         "否则压缩来不及在窗口溢出前生效"
     )
+if LONG_MEMORY_ENABLED and not (1 <= LM_RECENT_DAYS <= 30):
+    raise SystemExit(f"配置错误：lm_recent_days({LM_RECENT_DAYS}) 必须为 1~30 之间的整数")
+if LONG_MEMORY_ENABLED and LM_RECENT_MAX_ITEMS < 20:
+    raise SystemExit(f"配置错误：lm_recent_max_items({LM_RECENT_MAX_ITEMS}) 至少为 20")
+if LONG_MEMORY_ENABLED and LM_EVENT_EXPIRE_GRACE_DAYS < 0:
+    raise SystemExit(
+        f"配置错误：lm_event_expire_grace_days({LM_EVENT_EXPIRE_GRACE_DAYS}) 不能为负数")
 if LONG_MEMORY_ENABLED and LM_COMPRESS_COUNT % 2 != 0:
     raise SystemExit(
         f"配置错误：lm_compress_count({LM_COMPRESS_COUNT}) 必须是偶数，以保证裁剪落在对话边界上"
@@ -178,6 +200,21 @@ PERSONA = PERSONA_TEMPLATE.replace("{bot_name}", ROBOT_NAME)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("DeepSeekBot")
+
+# 错误日志落盘。控制台日志一关窗就没了——上次排查"记忆被清空"时最大的障碍就是
+# log.warning / log.error 全都没留下，只能靠时间戳和文件内容反推。
+# 这里把 WARNING 及以上另存一份文件：只记异常与告警，不记常规流水
+# （INFO 量太大，会把文件刷满反而淹没真正的问题）。
+if CFG.get("log_file_enabled", True):
+    try:
+        _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 CFG.get("log_file", "bot_error.log"))
+        _fh = RotatingFileHandler(_log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        _fh.setLevel(logging.WARNING)
+        _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logging.getLogger().addHandler(_fh)
+    except Exception as _e:
+        print(f"[warn] 错误日志文件无法创建，本次仅输出到控制台：{_e}")
 
 # DeepSeek 客户端（主回复：是否思考由 enable_thinking 决定）
 client = AsyncOpenAI(
@@ -437,6 +474,90 @@ def _clean_l1_facts(raw) -> list[dict]:
         return []
     return [f for f in (_fact_from_item(i) for i in raw) if f]
 
+
+def _clean_recent(raw) -> dict:
+    """清洗 recent 字段（按天分组的近期流水）。坏数据直接丢弃，不带病运行。
+
+    结构固定为 {"YYYY-MM-DD": ["一句话", ...]}，按日期升序返回。
+    条目兼容两种写法：纯字符串，或 {"d": ..., "c": ...} 的对象（模型输出用后者，
+    存盘时统一压成字符串数组，省体积也更难出错）。
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for day, items in raw.items():
+        d = str(day).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) or not isinstance(items, list):
+            continue
+        texts = []
+        for it in items:
+            c = it.get("c") if isinstance(it, dict) else it
+            c = str(c or "").replace("\n", " ").strip()
+            if c:
+                texts.append(c[:120])
+        if texts:
+            out[d] = texts
+    return {d: out[d] for d in sorted(out)}
+
+
+def _day_cutoff(today: str, keep_days: int) -> str:
+    """算出"保留最近 keep_days 天"的截止日期（早于它的整日该被淘汰）。"""
+    return (datetime.strptime(today, "%Y-%m-%d").date()
+            - timedelta(days=max(0, keep_days - 1))).isoformat()
+
+
+def _prune_recent(recent: dict, today: str) -> tuple[dict, list[str]]:
+    """按天淘汰 recent：先删超期的整天，再按条数上限从最老的一天整天删。
+
+    返回 (清理后的 recent, 告警文本列表)。
+    刻意整天删而不是删单条——半天流水比没有更让人困惑，而且按天淘汰才能让
+    "保留最近 N 天"这个语义保持清晰。
+    """
+    notes = []
+    if not isinstance(recent, dict) or not recent:
+        return {}, notes
+
+    # 1) 超期淘汰
+    cutoff = _day_cutoff(today, LM_RECENT_DAYS)
+    expired = sorted(d for d in recent if d < cutoff)
+    for d in expired:
+        del recent[d]
+    if expired:
+        notes.append(f"recent 淘汰了 {len(expired)} 个过期日（{expired[0]}~{expired[-1]}）")
+
+    # 2) 条数保护：从最老的一天整天删，至少保留最近一天
+    total = sum(len(v) for v in recent.values())
+    while total > LM_RECENT_MAX_ITEMS and len(recent) > 1:
+        oldest = min(recent)
+        total -= len(recent[oldest])
+        del recent[oldest]
+        notes.append(f"recent 超过 {LM_RECENT_MAX_ITEMS} 条，整天删除最老的 {oldest}")
+    if total > LM_RECENT_MAX_ITEMS:
+        # 只剩最近一天还超限 —— 这不是"数据太多"，是抽取粒度失控了
+        notes.append(f"recent 删到只剩最近一天仍有 {total} 条，超过上限 "
+                     f"{LM_RECENT_MAX_ITEMS}：疑似抽取粒度失控（单日流水过多）")
+    return recent, notes
+
+
+def _prune_expired_events(facts: list[dict], today: str) -> tuple[list[dict], int]:
+    """删掉 exp 过期超过宽限期的 event（代码侧兜底，确定性动作）。
+
+    为什么要代码来做：exp 到期后这条 event 就不再注入了，但模型未必记得删
+    （prompt 只在"整库超配额"时才要求删过期 event），于是它会一直占着 facts 配额。
+    留宽限期是为了等对方过几天提起结果，让模型有机会先把它改写成已发生的事件。
+    """
+    if LM_EVENT_EXPIRE_GRACE_DAYS <= 0:
+        return facts, 0
+    cutoff = _day_cutoff(today, LM_EVENT_EXPIRE_GRACE_DAYS + 1)
+    kept, dropped = [], 0
+    for f in facts:
+        if f.get("t") == "event" and (f.get("exp") or "") and f["exp"] < cutoff:
+            dropped += 1
+            continue
+        kept.append(f)
+    return kept, dropped
+
+
 def load_long_memory():
     """载入 L1 长期记忆库。缺失或损坏时退化为空库（不会影响主对话）。"""
     global long_memories
@@ -463,6 +584,8 @@ def load_long_memory():
             "version": version,
             "updated": str(entry.get("updated") or ""),
             "facts": facts,
+            # 旧数据没有 recent 字段，_clean_recent 对 None 返回空字典 → 自然兼容
+            "recent": _clean_recent(entry.get("recent")),
         }
 
 def save_long_memory():
@@ -642,16 +765,19 @@ def _today_str() -> str:
 
 
 def format_l1_block(key: str) -> str:
-    """把 L1 渲染成注入主回复的记忆块（按类型分组、人话表达）。
+    """把 L1 渲染成注入主回复的记忆块（长期事实按类型分组 + 最近几天流水）。
 
     刻意与存储格式分离：磁盘上是结构化条目，注入时是人话短句。
     - 已过期的事件（exp 早于今天）直接过滤掉，纯本地字符串比较，不消耗 token
     - 排序：类型优先级 → 提及次数(n)多 → 最近提及(seen)新
     - 不再按字数截断：容量改由「条目数配额」在整理时约束，这里只留一根极宽松的保险丝
+    - 长期事实在前、近期流水在后，并且明确告诉模型后者只是背景参考：
+      两块一起注入而不分主次的话，模型很可能拿几天前的琐事去覆盖长期认知。
     """
     entry = long_memories.get(key) or {}
     facts = entry.get("facts") or []
-    if not facts:
+    recent = entry.get("recent") or {}
+    if not facts and not recent:
         return ""
 
     today = _today_str()
@@ -677,7 +803,7 @@ def format_l1_block(key: str) -> str:
     groups: dict[str, list[str]] = {}
     kept = 0
     for f in ordered:
-        # 保险丝：正常配置（L1 上限 80 条）永远碰不到，只在模型异常输出几百条时兜底，
+        # 保险丝：正常配置（L1 上限 100 条）永远碰不到，只在模型异常输出几百条时兜底，
         # 免得异常数据把每轮请求的上下文撑爆。这里静默截断，告警由 compress_memory 在
         # 整理完成时打一次——本函数每轮私聊都会调用，在这里打日志会刷屏。
         if kept >= LM_L1_INJECT_HARD_LIMIT:
@@ -689,19 +815,33 @@ def format_l1_block(key: str) -> str:
         groups.setdefault(t, []).append(line)
         kept += 1
 
-    if not groups:
-        return ""
+    blocks = []
+    if groups:
+        body = "\n".join(
+            f"{LM_TYPE_LABEL.get(t, t)}：\n" + "\n".join(groups[t])
+            for t in sorted(groups, key=lambda x: LM_TYPE_ORDER.get(x, 9))
+        )
+        blocks.append(
+            "【长期记忆·你与这个人之间】\n"
+            "以下是你以前和这个人聊天时记住的事——关于对方的、你自己说过的、以及你们共同的。"
+            "用来保持连贯和亲切。像真人一样自然使用：需要时自然带出来，不要复述、不要念清单、"
+            "不要说“根据我的记忆”，也不要把这些当成本轮对方说的话。\n" + body
+        )
 
-    body = "\n".join(
-        f"{LM_TYPE_LABEL.get(t, t)}：\n" + "\n".join(groups[t])
-        for t in sorted(groups, key=lambda x: LM_TYPE_ORDER.get(x, 9))
-    )
-    return (
-        "\n\n【长期记忆·你与这个人之间】\n"
-        "以下是你以前和这个人聊天时记住的事——关于对方的、你自己说过的、以及你们共同的。"
-        "用来保持连贯和亲切。像真人一样自然使用：需要时自然带出来，不要复述、不要念清单、"
-        "不要说“根据我的记忆”，也不要把这些当成本轮对方说的话。\n" + body
-    )
+    # 最近几天的流水。按日期过滤一次是防"压缩间隔过长"——那种情况下磁盘上还留着
+    # 过期日子，光靠整理时清理不够及时。
+    cutoff = _day_cutoff(today, LM_RECENT_DAYS)
+    lines = [f"- {d[5:]} {c}"
+             for d in sorted(recent) if d >= cutoff
+             for c in recent[d]]
+    if lines:
+        blocks.append(
+            "【最近几天】（只是背景参考，用来避免重复提问、让接话更自然；\n"
+            "涉及长期状态、性格、偏好、约定时一律以上面的【长期记忆】为准，别被这几天的小事带偏）\n"
+            + "\n".join(lines)
+        )
+
+    return ("\n\n" + "\n\n".join(blocks)) if blocks else ""
 
 
 def format_l0_for_compression(segment: list[dict]) -> str:
@@ -745,71 +885,81 @@ def format_l0_for_compression(segment: list[dict]) -> str:
 # 整理 prompt 模板：{max_facts} / {type_quota} 由下面用 replace 填充。
 # 不能用 str.format —— 正文里有 {"profile":[...]} 这样的字面 JSON 花括号，format 会直接 KeyError。
 # 填充在模块加载时完成一次，之后 system 前缀固定不变，有利于 prompt 命中缓存（成本差约 50 倍）。
-LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现有记忆库」与「新对话片段」合并成一份新的记忆库。
+LM_COMPRESS_SYSTEM_TEMPLATE = """你是长期记忆整理器，负责把「现有记忆库」与「新对话片段」合并，并补充近期流水。
 只输出 JSON，不要任何解释、不要 markdown 代码块。
 
-抽取规则：
-1. 新片段里，标记为「对方：」的是对方说的话，标记为「我：」的是你自己说过的话。两边都要整理，但口径不同（见规则 7~10）。
-2. 涉及"你是不是AI/机器人/程序/模型"之类的话题，一律跳过。同时**绝不要记录你的身世与外部经历**（父母、工作、学历、住址、去过哪、见过谁）——那些是你顺着话头编的，一旦记下，下次你会把它当成真的，人设会越漂越远。
-3. 保留具体专有信息：人名、昵称、地名、日期、数字、物品名。宁可句子略长，也不要丢掉这些细节。
-4. 合并重复项：同一件事被反复提到时合并成一条，把次数累加上去（旧条目 n=3、本轮又提到 1 次，新条目就是 n=4）。
-5. 状态会被新信息取代：如果新片段说明某个旧事实已经改变（例如从杭州搬到上海、换了工作、分手了、猫送人了），必须把旧的那条删掉或改写成"从X变成Y"，绝不能旧状态和新状态同时留着，否则会自相矛盾。
-6. 对方明确要求保密、或属于隐私的事，把 sensitive 置为 true；但类型仍按内容本身来选，sensitive 只是标记，不是类型。
-7. 「我：」里**只**记这三类，都归到 self：
-   · 我的承诺、我答应过对方的事（例如"我说过六点会等他"）；
-   · 我对这段关系的表态与立场（例如"我说过他是我最重要的人"）；
-   · 我形成的相处习惯与偏好（例如"我喜欢被他叫妹妹""我习惯每晚跟他说晚安"）。
-8. 「我：」里这些一律不记：我编造的身世与外部经历、我随口描述的外部世界、只是一时情绪或玩笑的话、一次性的闲聊细节。
-9. 双方**共同**建立的（共同约定、共同养成的习惯、共同经历、相处模式）归 shared，例如"我们说好每次不知道说什么就加一句喜欢你"。
-10. 归属别弄反：对方许下的承诺归 promise；你自己许下的承诺归 self；双方一起定下的归 shared。
+■ 怎么读输入
+- 新片段里「对方：」是对方说的话，「我：」是你自己说过的话。两边都要整理，口径见下。
+- 「现有记忆库」是紧凑单行格式：类型缩写|内容|最近提及日期|n出现次数[|exp到期日][|敏感]
+  缩写对应：p=profile、r=relation、f=preference、m=promise、e=event、s=self、u=shared
+- 「最近已记的流水」是已经记过的近期日常，只用来避免重复，不需要复述。
 
-记忆类型（只能用这 7 个）：
-- profile：对方的基本信息（名字、年龄、城市、职业、学业、生活习惯等）
+■ 七种类型（只能用这些）
+- profile：对方的稳定信息（名字、年龄、城市、职业、学业、长期习惯）
 - relation：对方生活中的重要关系与宠物
-- preference：对方的喜好与厌恶（喜欢/讨厌什么、雷区）
+- preference：对方的喜好与厌恶、雷区
 - promise：**对方**许下的承诺、答应过你的事
-- event：对方提到的一次性事件（考试、旅行、面试等），必须填 exp 预计结束日期
-- self：关于「我」（你自己）的：我说过的承诺、表明过的立场、形成的相处习惯与偏好
+- event：对方生活中**有明确时间点**的事，过去和将来都算（考试、面试、旅行、就医、重要决定）
+  · 还没发生 → 填 exp 预计日期
+  · 已经发生 → 内容改写成结果（如"考完了""面试没过"），exp 省略
+- self：关于「我」（你自己）的：我的承诺、我对这段关系的表态、我形成的相处习惯与偏好
 - shared：你和对方**共同**建立的：共同约定、共同习惯、共同经历、相处模式
 
-容量与取舍：
+■ 抽取原则
+1. 只抽取有信息量的内容，寒暄和客套话不要。
+2. 保留具体专有信息：人名、昵称、地名、日期、数字、物品名。宁可句子略长，也不要丢细节。
+3. 合并重复：同一件事反复提到就合并成一条，n 在原值基础上累加（旧 n=3、本轮又提到 1 次 → 新 n=4）。
+4. 状态会被新信息取代：旧事实若已改变（搬家、换工作、分手、猫送人），必须删掉旧的或改写成"从X变成Y"，绝不能新旧并存。
+5. 对方明确要求保密或属于隐私的事，把 sensitive 置为 true；但类型仍按内容本身选，sensitive 只是标记。
+6. 归属别弄反：对方许的诺 → promise；**我**许的诺 → self；双方一起定的 → shared。
+7. 每条事实的 c 字段不超过 40 字。
+
+■ 关于「我：」的内容
+- 只记三类，都归 self：我的承诺、我对这段关系的表态、我形成的相处习惯与偏好。
+- 除此之外一律不记（我随口描述的外部世界、一时情绪或玩笑、一次性的闲聊细节）。
+
+■ recent_new：近期流水（只给新增的）
+- 它和上面的长期事实是两回事：这里记"最近这几天具体发生了什么"。
+- 记什么：对方日常里**有具体内容**的事——吃了什么、去了哪、做了什么、心情如何、身体怎样。
+- 不记什么：寒暄、纯情绪表达、以及「最近已记的流水」里已经有的条目。
+- 每条不超过 30 字，写成客观陈述（"晚上点了猪脚饭"），不要写成对话。
+- 只输出本次新发现的，不要复述历史。格式：[{"d":"2026-09-14","c":"中午刚醒，说要去吃饭"}]
+- 日期取新片段里那条消息前面的日期。
+
+■ 红线（绝不允许）
+- 记录你编造的身世与外部经历（父母、工作、学历、住址、去过哪、见过谁）——那些是你顺着话头编的，一旦记下，下次你会把它当成真的。
+- 记录涉及"你是不是 AI/机器人/程序/模型"的话题。
+- 把同一条事实同时放进两个类型。
+- 因为"本轮新片段没有新信息"就删除任何条目——没有新信息时，把现有记忆库原样输出。
+
+■ 容量与取舍
 整库上限 {max_facts} 条；各类型参考上限：{type_quota}。
 这是「上限」不是「目标」：没到上限不要凑数，更不许编造。
 
 只有这三种情况允许删除已有条目：
-① 被新片段取代（见规则 5）。
-② 整库超过 {max_facts} 条时，先删"超出自身参考上限"的那一类，规则是——
+① 被新片段取代（见原则 4）。
+② 整库超过 {max_facts} 条时，先删"超出自身参考上限"的那一类：
    · event：先删 exp 早于今天的，再删 seen 最早的；
    · 其他类型：先删 n 最小的，n 相同时删 seen 最早的；
      n 和 seen 都相同时，才由你判断哪条更实质、更该留。
    注意：基本信息、关系、偏好、约定、我的立场、我们之间这几类不会因为"很久没提到"而失去价值，别把 seen 当主要依据。
-③ 同一件事的重复条目：合并成一条（见规则 4）。
+③ 同一件事的重复条目合并（见原则 3）。
 
-绝不允许：
-· 因为"本轮新片段没有新信息"就删除任何条目 —— 没有新信息时，把现有记忆库原样输出；
-· 记录你编造的身世与外部经历（父母、工作、学历、住址、去过哪、见过谁）；
-· 删除带 sensitive 标记的条目（除非被新信息取代）；
-· 删除对方的身份锚点：名字、城市、职业、学业；
-· 删除 self / shared 里关于这段关系的关键内容（除非被新信息取代）；
-· 把同一条事实同时放进两个类型。
-
+删条目时必须保留：带 sensitive 标记的、对方的身份锚点（名字/城市/职业/学业）、
+self 与 shared 里关于这段关系的关键内容——除非它们被新信息取代。
 准确优先于数量：配额冲突时宁可略超上限，也不要丢信息。
-每条事实的 c 字段不超过 40 字。
 
-输出格式（按类型分桶，桶名就是类型，桶内不要再写 t 字段）：
+■ 输出格式
+按类型分桶，桶名就是类型，桶内不要再写 t 字段；另加一个 recent_new 放最后。
 {"profile":[{"c":"名字叫阿哲","seen":"2026-09-12","n":2}],
  "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}],
- "self":[{"c":"我说过会一直陪着他","seen":"2026-09-13","n":1}]}
+ "self":[{"c":"我说过会一直陪着他","seen":"2026-09-13","n":1}],
+ "recent_new":[{"d":"2026-09-14","c":"中午刚醒，说要去吃饭"}]}
 字段：c=一句话内容（不超过40字）；seen=该事实最近提及日期 YYYY-MM-DD；
-exp=仅 event 填预计结束日期，没有就整条省略该字段；n=该事实累计出现次数；
+exp=仅 event 且尚未发生时填，其余情况整条省略该字段；n=该事实累计出现次数；
 sensitive=只有需要保密时才写 true，否则整个字段省略。
 空桶直接省略，不要写空数组；桶的排列顺序固定为：
-profile、relation、preference、promise、event、self、shared。
-
-另外，「现有记忆库」用紧凑单行格式给你，字段依次是：
-  类型缩写|内容|最近提及日期|n出现次数[|exp到期日][|敏感]
-类型缩写对应：p=profile、r=relation、f=preference、m=promise、e=event、s=self、u=shared。
-你的输出必须用上面的分桶 JSON 格式，不要沿用紧凑格式。"""
+profile、relation、preference、promise、event、self、shared、recent_new。"""
 
 LM_COMPRESS_SYSTEM = (
     LM_COMPRESS_SYSTEM_TEMPLATE
@@ -856,15 +1006,43 @@ async def memory_llm(system: str, user: str) -> str | None:
     return None
 
 
-def parse_l1_facts(raw: str) -> list[dict] | None:
-    """解析压缩模型返回的事实库，任何异常都返回 None（由调用方放弃本次压缩、下轮重试）。
+def _parse_recent_new(raw) -> dict:
+    """解析 recent_new（本次新发现的近期流水），压成 {日期: [句子]}。
 
-    模型按「类型分桶」输出，桶名即类型，桶内条目不再写 t 字段：
+    只接受「带日期的对象数组」；日期缺失或格式不对的按今天算——模型偶尔会漏日期，
+    总比把这条信息整条丢掉好。补上来的日期之后还会被 _prune_recent 统一按天裁剪。
+    """
+    out = {}
+    if not isinstance(raw, list):
+        return out
+    today = _today_str()
+    for it in raw:
+        if isinstance(it, dict):
+            c = str(it.get("c") or "").strip()
+            d = str(it.get("d") or "").strip()
+        else:
+            c, d = str(it or "").strip(), ""
+        if not c:
+            continue
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            d = today
+        out.setdefault(d, []).append(c.replace("\n", " ")[:120])
+    return out
+
+
+def parse_l1_facts(raw: str) -> dict | None:
+    """解析压缩模型返回的结果，任何异常都返回 None（由调用方放弃本次压缩、下轮重试）。
+
+    模型按「类型分桶」输出，桶名即类型，桶内条目不再写 t 字段；另外用一个特殊键
+    recent_new 单独给出"本次新发现的近期流水"（是增量，不是完整列表）：
         {"profile":[{"c":"名字叫阿哲","seen":"2026-09-12","n":2}],
-         "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}]}
+         "event":[{"c":"9月20日期末考试","seen":"2026-09-14","exp":"2026-09-20","n":1}],
+         "recent_new":[{"d":"2026-09-14","c":"中午刚醒，说要去吃饭"}]}
     分桶的原因：让模型能直接数出每类有几条。它数得清条目、数不清字数，
     而"以为字数额度不够"正是上次把整库删空的诱因之一。
     空桶可以省略；同时兼容旧的扁平 {"facts":[...]} 格式，以防模型偶尔退化回旧写法。
+
+    返回 {"facts": [...], "recent": {日期: [句子]}}；失败返回 None。
     """
     text = raw.strip()
     if text.startswith("```"):  # 容错：去掉可能的代码块围栏
@@ -879,6 +1057,8 @@ def parse_l1_facts(raw: str) -> list[dict] | None:
         log.warning(f"长期记忆：压缩结果的顶层不是对象（{type(data).__name__}），本次跳过")
         return None
 
+    recent_new = _parse_recent_new(data.get("recent_new"))
+
     facts: list[dict] = []
     if isinstance(data.get("facts"), list):
         # 旧扁平格式：类型来自每条自己的 t 字段
@@ -887,10 +1067,10 @@ def parse_l1_facts(raw: str) -> list[dict] | None:
             f = _fact_from_item(item)
             if f:
                 facts.append(f)
-        return facts
+        return {"facts": facts, "recent": recent_new}
 
-    # 分桶格式：桶名即类型
-    unknown = [k for k in data if k not in LM_TYPE_ORDER]
+    # 分桶格式：桶名即类型（recent_new 不是类型桶，要从"未知桶"里排除）
+    unknown = [k for k in data if k not in LM_TYPE_ORDER and k != "recent_new"]
     for bucket, items in data.items():
         if bucket not in LM_TYPE_ORDER or not isinstance(items, list):
             continue
@@ -905,7 +1085,7 @@ def parse_l1_facts(raw: str) -> list[dict] | None:
             # 必须放弃本次压缩：否则会把整库写成一个空记忆库，又是一次空覆盖。
             log.warning("长期记忆：没有任何可识别的桶，本次跳过")
             return None
-    return facts
+    return {"facts": facts, "recent": recent_new}
 
 
 def format_l1_for_prompt(facts: list[dict]) -> str:
@@ -925,6 +1105,21 @@ def format_l1_for_prompt(facts: list[dict]) -> str:
             line += "|敏感"
         lines.append(line)
     return "\n".join(lines)
+
+
+def format_recent_for_prompt(recent: dict, days: int = 2) -> str:
+    """把最近几天的流水渲染给压缩模型，让它别把已经记过的事再记一遍。
+
+    recent 是"增量追加"的：模型只输出本次新发现的事，代码负责追加和淘汰。
+    但增量追加最大的风险是重复——同一件事在相邻几次压缩里被反复追加。
+    所以要把"已经记过的"摆给它看，而只看最近两天就够：重复几乎都发生在同一天内，
+    喂整份列表只是白烧 token（200 条能到 5000 字符）。
+    """
+    if not recent:
+        return "（无）"
+    cutoff = _day_cutoff(_today_str(), days)
+    lines = [f"{d} {c}" for d in sorted(recent) if d >= cutoff for c in recent[d]]
+    return "\n".join(lines) if lines else "（无）"
 
 
 async def compress_memory(key: str, gen: int) -> None:
@@ -954,6 +1149,7 @@ async def compress_memory(key: str, gen: int) -> None:
                 return
             segment = memories[key][:seg_len]
             old_facts = deepcopy((long_memories.get(key) or {}).get("facts") or [])
+            old_recent = deepcopy((long_memories.get(key) or {}).get("recent") or {})
 
         new_text = format_l0_for_compression(segment)
         if not new_text.strip():
@@ -967,13 +1163,17 @@ async def compress_memory(key: str, gen: int) -> None:
             f"【新对话片段】（集中注意力处理这里）\n{new_text}\n\n"
             f"【现有记忆库】（这是合并的起点，输出里必须完整体现它的内容）\n"
             f"{format_l1_for_prompt(old_facts)}\n\n"
-            f"请把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
-            f"- 输出必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
+            f"【最近已记的流水】（下面这些已经记过了，recent_new 里不要再写一遍，"
+            f"只给本次新发现的）\n{format_recent_for_prompt(old_recent)}\n\n"
+            f"请分两部分输出：\n"
+            f"1. 各类型桶：把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
+            f"   - 必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
             f"或整库超上限按规则淘汰的除外）。\n"
-            f"- 新片段里的新信息一条都不能漏：关于对方的新情况与状态变化（搬家、换工作、"
+            f"   - 新片段里的新信息一条都不能漏：关于对方的新情况与状态变化（搬家、换工作、"
             f"宠物生病、新养成的习惯），以及「我：」里你自己的承诺、表态与相处习惯，"
             f"还有双方共同建立的约定与习惯。\n"
-            f"- 即使新片段里没有任何新信息，也要把现有记忆库原样输出，绝不能输出空结果。\n"
+            f"   - 即使新片段里没有任何新信息，也要把现有记忆库原样输出，绝不能输出空结果。\n"
+            f"2. recent_new：本次新发现的近期流水（只要新的，不要重复上面已记过的）。\n"
             f"- 今天是 {_today_str()}，据此判断 event 的 exp 是否已过期。"
         )
         try:
@@ -985,9 +1185,24 @@ async def compress_memory(key: str, gen: int) -> None:
             # memory_llm 内部已记录原因；本次放弃，L0 与 L1 都不动，下轮达到阈值再试
             return
 
-        facts = parse_l1_facts(raw)
-        if facts is None:
+        parsed = parse_l1_facts(raw)
+        if parsed is None:
             return
+        facts = parsed["facts"]
+        recent_new = parsed["recent"]
+        today = _today_str()
+
+        # 过期 event 兜底清理。这些条目早就不注入了，但模型未必记得删
+        # （prompt 只在"整库超配额"时才要求删过期 event），留着只是白占 facts 配额。
+        # 若清完会让整个记忆库变空，则本次不删——宁可留着过期条目，也不要制造空库。
+        pruned, dropped = _prune_expired_events(facts, today)
+        if dropped:
+            if pruned:
+                facts = pruned
+                log.info(f"长期记忆（{key}）：清理了 {dropped} 条过期已久的事件")
+            else:
+                log.warning(f"长期记忆（{key}）：{dropped} 条过期事件若清掉会让记忆库变空，"
+                            "本次保留不删（下轮再判断）")
 
         # 防护一：空结果一律不提交。
         # 事实库是整体重写的，"空结果"有两种伤害——覆盖既有记忆；或者旧库本来就空时，
@@ -1035,26 +1250,46 @@ async def compress_memory(key: str, gen: int) -> None:
         if old_facts and len(facts) < len(old_facts) * 0.5:
             log.warning(f"长期记忆（{key}）：本次整理出 {len(facts)} 条，不足既有 {len(old_facts)} 条的一半，"
                         "疑似误删（仅告警，不拦截；可对比 .bak 备份确认）")
+        new_recent_count = sum(len(v) for v in recent_new.values())
+        if new_recent_count:
+            log.info(f"长期记忆（{key}）：本次新增近期流水 {new_recent_count} 条（{len(recent_new)} 天）")
 
         # 第三段：锁内原子提交（全程无 await）
         async with get_mem_lock(key):
             if generations.get(key, 0) != gen:
                 log.info(f"长期记忆（{key}）压缩结果已作废：期间执行过清空记忆")
                 return
+
+            # recent 增量合并：模型只给新增的，代码负责追加、去重与按天淘汰。
+            # 正因为它从不被"整体重写"，结构上就不存在被模型误删的可能——
+            # 这是 recent 与 facts 最根本的区别。
+            cur_recent = deepcopy((long_memories.get(key) or {}).get("recent") or {})
+            for d, items in recent_new.items():
+                bucket = cur_recent.setdefault(d, [])
+                for c in items:
+                    if c not in bucket:     # 同日去重，挡住相邻两次压缩的重复追加
+                        bucket.append(c)
+            cur_recent, prune_notes = _prune_recent(cur_recent, today)
+
             long_memories[key] = {
                 "version": (long_memories.get(key) or {}).get("version", 0) + 1,
                 "updated": get_beijing_time_str(),
                 "facts": facts,
+                "recent": cur_recent,
             }
             save_long_memory()                      # 先写 L1
             del memories[key][:seg_len]             # 再裁 L0
             save_memory()
+            for note in prune_notes:
+                log.warning(f"长期记忆（{key}）：{note}")
             detail = "、".join(
                 f"{LM_TYPE_LABEL.get(t, t)} {type_counts[t]}"
                 for t in sorted(type_counts, key=lambda x: LM_TYPE_ORDER.get(x, 9))
             )
+            recent_total = sum(len(v) for v in cur_recent.values())
             log.info(f"长期记忆（{key}）已压缩：L0 -{seg_len} 条，现有 {len(memories.get(key, []))} 条；"
-                     f"L1 共 {len(facts)}/{LM_L1_MAX_FACTS} 条（{detail}），n>1 的 {multi_mentioned} 条")
+                     f"L1 共 {len(facts)}/{LM_L1_MAX_FACTS} 条（{detail}），n>1 的 {multi_mentioned} 条；"
+                     f"近期流水 {recent_total} 条 / {len(cur_recent)} 天")
     except Exception as e:
         # 兜底：任何意外都不能把主对话链路带崩
         compress_scheduled.discard(key)
@@ -1998,7 +2233,9 @@ async def main():
     load_long_memory()
     if LONG_MEMORY_ENABLED:
         log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，每次压缩 {LM_COMPRESS_COUNT} 条，"
-                 f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}），存储于 {LM_FILE}")
+                 f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}）；"
+                 f"近期流水保留 {LM_RECENT_DAYS} 天 / 最多 {LM_RECENT_MAX_ITEMS} 条，"
+                 f"过期事件宽限 {LM_EVENT_EXPIRE_GRACE_DAYS} 天；存储于 {LM_FILE}")
     log.info(f"正在连接 NapCat: {WS_URL}")
     if AUTO_RELOGIN:
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"
