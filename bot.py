@@ -1757,7 +1757,7 @@ async def handle_message(ws, data: dict):
                 # 超出上限，仍标记类型，但显示加载失败
                 descriptions.append(f"第{idx}张：{type_tag}图片加载失败")
 
-        image_desc = f"（你看到了{total_images}张图片/表情包，内容依次是：{'；'.join(descriptions)}）"
+        image_desc = f"（此处是{total_images}张图片/表情包，内容依次是：{'；'.join(descriptions)}）"
 
     # 合并文本和图片描述
     if image_desc:
