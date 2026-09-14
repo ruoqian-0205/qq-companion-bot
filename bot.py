@@ -115,6 +115,12 @@ LM_L1_INJECT_CHARS = CFG.get("lm_l1_inject_chars", 800)
 # 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
 LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
 
+# ---- 多段回复（模型用空行分隔时，按段依次发送多条消息）----
+# 模型可以用「连续两个换行」把一次回复分成多条短消息，更接近真人在 QQ 上连发几条。
+SPLIT_REPLY_ENABLED = CFG.get("split_reply_enabled", True)
+SPLIT_REPLY_MAX = CFG.get("split_reply_max", 5)                    # 最多拆成几条，超出合并到最后一条
+SPLIT_REPLY_INTERVAL = tuple(CFG.get("split_reply_interval", [0.5, 1.5]))   # 每条之间的随机间隔(秒)
+
 # 记忆整理（压缩）是否开启思考模式。默认跟随全局 enable_thinking。
 # 实测：开启思考后判断力明显更好——能正确区分"已撤销/已放弃"与"仍有效"的事件，
 # 不会漏掉生日、家人健康这类重要信息（关闭思考时会漏），条目也更精炼。
@@ -254,6 +260,14 @@ def get_beijing_time_str() -> str:
     weekday_cn = '一二三四五六日'[now.weekday()]  # 周一对应 '一'
     return now.strftime("%Y-%m-%d %H:%M") + f" 周{weekday_cn}"
 
+# 昵称前缀正则：预编译一次。必须把 {ROBOT_NAME} 真正替换成角色名，
+# 并用 re.escape 转义（角色名可能含正则元字符）；旧代码把 r'^{ROBOT_NAME}...'
+# 当普通字符串用，导致它在逐字匹配 "{ROBOT_NAME}"、前缀清理从未生效。
+_ROBOT_NAME_RE = re.compile(
+    r'^' + re.escape(ROBOT_NAME) + r'[（(]?\d*[)）]?\s*[:：]\s*'
+)
+
+
 def clean_reply(text: str) -> str:
     """
     清理 AI 回复开头可能误输出的时间戳、昵称前缀等垃圾信息。
@@ -278,7 +292,7 @@ def clean_reply(text: str) -> str:
                 continue  # 可能还有下一个前缀，继续循环
 
         # 2. 清理“{ROBOT_NAME}（QQ号）：”或“{ROBOT_NAME}：”等昵称前缀
-        match = re.match(r'^{ROBOT_NAME}[（(]?\d*[)）]?\s*[:：]\s*', stripped)
+        match = _ROBOT_NAME_RE.match(stripped)
         if match:
             text = stripped[match.end():].lstrip()
             continue  # 清理后可能还有残留，继续检查
@@ -287,6 +301,30 @@ def clean_reply(text: str) -> str:
         break
 
     return text.strip()
+
+
+def split_reply(reply: str) -> list[str]:
+    """把模型的回复按「连续空行」拆成多条消息，每条单独 clean_reply。
+
+    模型可以用空行把一次回复分成几条短消息，更接近真人在 QQ 上连发。
+    注意只按"连续两个换行"（中间允许空白）分割，单个换行保留。
+    超过 SPLIT_REPLY_MAX 条时，把多余部分合并到最后一条（避免越拆越多）。
+    """
+    if not reply:
+        return []
+    if not SPLIT_REPLY_ENABLED:
+        one = clean_reply(reply)
+        return [one] if one else []
+    parts = [p.strip() for p in re.split(r"\n\s*\n", reply)]
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+    if len(parts) > SPLIT_REPLY_MAX:
+        head = parts[:SPLIT_REPLY_MAX - 1]
+        merged = "……".join(parts[SPLIT_REPLY_MAX - 1:])
+        parts = head + [merged]
+    cleaned = [clean_reply(p) for p in parts]
+    return [c for c in cleaned if c]
 
 # ---------- 记忆读写 ----------
 def _atomic_write_json(path: str, data) -> None:
@@ -1431,6 +1469,33 @@ async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> b
     log.error(f"群消息发送失败 gid={gid} 回执={data} 内容={text[:60]!r}")
     return False
 
+async def send_assistant_reply(ws, text: str,
+                               uid: int | None = None,
+                               gid: int | None = None,
+                               at_qq: int | None = None) -> list[str]:
+    """把回复按空行拆分后依次发送，返回**已成功送达**的段。
+
+    调用方据此决定写入记忆的内容：只记真正发出去的，避免"没送达却被当成说过了"。
+    多段之间加随机延迟，一是更像真人打字，二是避免连续发送触发风控。
+    """
+    parts = split_reply(text)
+    sent: list[str] = []
+    for i, part in enumerate(parts):
+        if i > 0 and SPLIT_REPLY_INTERVAL[1] > 0:
+            await asyncio.sleep(random.uniform(*SPLIT_REPLY_INTERVAL))
+        if gid is not None:
+            ok = await send_group_msg(ws, gid, part, at_qq=at_qq)
+        else:
+            ok = await send_private_msg(ws, uid, part)
+        if ok:
+            sent.append(part)
+        else:
+            log.warning(f"第 {i + 1}/{len(parts)} 段发送失败，后续段落停止发送")
+            break
+    if len(parts) > 1:
+        log.info(f"回复拆分为 {len(parts)} 条发送，成功 {len(sent)} 条")
+    return sent
+
 # ---------- 事件处理 ----------
 async def handle_message(ws, data: dict):
     mtype = data.get("message_type")
@@ -1514,9 +1579,12 @@ async def handle_message(ws, data: dict):
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
         # 阶段 3：先发送、确认送达后才写记忆 —— 送不出去的话不该被当成"已经说过"
-        if await send_private_msg(ws, uid, reply):
+        # 回复可能含空行分隔的多段，逐条发送；只把成功送达的段记进 L0
+        sent_parts = await send_assistant_reply(ws, reply, uid=uid)
+        if sent_parts:
             async with get_mem_lock(key):
-                await append_memory(key, "assistant", reply)
+                for part in sent_parts:
+                    await append_memory(key, "assistant", part)
         else:
             log.warning(f"私聊回复未送达，不写入记忆（避免后续对话基于未发生的内容）uid={uid}")
 
@@ -1559,9 +1627,12 @@ async def handle_message(ws, data: dict):
         group_consecutive_replies[gid] = group_consecutive_replies.get(gid, 0) + 1
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
-        if await send_group_msg(ws, gid, reply, at_qq=uid if mentioned else None):
+        sent_parts = await send_assistant_reply(ws, reply, gid=gid,
+                                                at_qq=uid if mentioned else None)
+        if sent_parts:
             async with get_mem_lock(key):
-                await append_memory(key, "assistant", reply)
+                for part in sent_parts:
+                    await append_memory(key, "assistant", part)
         else:
             log.warning(f"群回复未送达，不写入记忆 gid={gid}")
 
@@ -1603,9 +1674,11 @@ async def proactive_loop_private(ws):
             reply = await proactive_chat(reply_msgs)
             if not reply:
                 continue
-            if await send_private_msg(ws, uid, reply):
+            sent_parts = await send_assistant_reply(ws, reply, uid=uid)
+            if sent_parts:
                 async with get_mem_lock(key):
-                    await append_memory(key, "assistant", reply)
+                    for part in sent_parts:
+                        await append_memory(key, "assistant", part)
             else:
                 log.warning(f"主动私聊未送达，不写入记忆 uid={uid}")
 
@@ -1640,9 +1713,11 @@ async def proactive_loop_group(ws):
             reply = await proactive_chat(reply_msgs)
             if not reply:
                 continue
-            if await send_group_msg(ws, gid, reply):
+            sent_parts = await send_assistant_reply(ws, reply, gid=gid)
+            if sent_parts:
                 async with get_mem_lock(key):
-                    await append_memory(key, "assistant", reply)
+                    for part in sent_parts:
+                        await append_memory(key, "assistant", part)
             else:
                 log.warning(f"主动群聊未送达，不写入记忆 gid={gid}")
 
