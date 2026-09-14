@@ -1107,33 +1107,54 @@ def format_l1_for_prompt(facts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_recent_for_prompt(recent: dict, days: int = 2) -> str:
-    """把最近几天的流水渲染给压缩模型，让它别把已经记过的事再记一遍。
+def _segment_days(segment: list) -> set:
+    """取出 L0 片段里出现过的所有日期（来自每条消息的时间戳前缀）。"""
+    days = set()
+    for m in segment:
+        mt = re.match(r"\[(\d{4}-\d{2}-\d{2})", str(m.get("content") or ""))
+        if mt:
+            days.add(mt.group(1))
+    return days
+
+
+def format_recent_for_prompt(recent: dict, seg_days=None) -> str:
+    """把"已经记过的流水"渲染给压缩模型，让它别把同一件事再记一遍。
 
     recent 是"增量追加"的：模型只输出本次新发现的事，代码负责追加和淘汰。
-    但增量追加最大的风险是重复——同一件事在相邻几次压缩里被反复追加。
-    所以要把"已经记过的"摆给它看，而只看最近两天就够：重复几乎都发生在同一天内，
-    喂整份列表只是白烧 token（200 条能到 5000 字符）。
+    但增量追加最大的风险是重复——同一件事在相邻几次压缩里被反复追加，
+    所以要把"已经记过的"摆给它看。
+
+    取哪几天：由 **L0 片段覆盖的日期**决定，而不是"今天往前 N 天"。
+    为什么不能按今天算：两次压缩的片段是首尾相接的（裁掉的就是刚取的那段），
+    所以 recent 里最新的日期不会晚于这次片段最老的日期；真正会出现的是反过来——
+    L0 攒得慢的时候，这次片段已经是前几天的了，按"今天"切窗口就会漏掉那几天，
+    模型看不到已记内容，于是重复记录。
+    取片段日期与 recent 日期的交集即可：片段是哪天的，就给哪天的素材。
+    万一片段里读不出日期（消息格式异常），退回"全都给"——多给只是费点 token，
+    漏给才会导致重复记忆。
     """
     if not recent:
         return "（无）"
-    cutoff = _day_cutoff(_today_str(), days)
-    lines = [f"{d} {c}" for d in sorted(recent) if d >= cutoff for c in recent[d]]
+    picked = {d: v for d, v in recent.items() if d in seg_days} if seg_days else recent
+    lines = [f"{d} {c}" for d in sorted(picked) for c in picked[d]]
     return "\n".join(lines) if lines else "（无）"
 
 
-def build_compress_user_prompt(new_text: str, old_facts: list, old_recent: dict) -> str:
+def build_compress_user_prompt(new_text: str, old_facts: list, old_recent: dict,
+                               seg_days=None) -> str:
     """组装压缩调用的 user prompt。
 
     单独抽成函数，是为了让"从日志重建记忆"这类一次性脚本能复用同一条 prompt。
     在脚本里复制一份的话，以后 prompt 一改必然漏同步——上一版重建脚本就是这么出问题的。
+
+    seg_days 是本次 L0 片段覆盖的日期集合，用来决定给它看哪几天的已有流水。
     """
     return (
         f"【新对话片段】（集中注意力处理这里）\n{new_text}\n\n"
         f"【现有记忆库】（这是合并的起点，输出里必须完整体现它的内容）\n"
         f"{format_l1_for_prompt(old_facts)}\n\n"
         f"【最近已记的流水】（下面这些已经记过了，recent_new 里不要再写一遍，"
-        f"只给本次新发现的）\n{format_recent_for_prompt(old_recent)}\n\n"
+        f"只给本次新发现的）\n{format_recent_for_prompt(old_recent, seg_days)}\n\n"
         f"请分两部分输出：\n"
         f"1. 各类型桶：把新片段里的信息合并进记忆库，输出更新后的完整记忆库。\n"
         f"   - 必须包含现有记忆库中所有仍然有效的条目（被新信息取代、"
@@ -1179,12 +1200,14 @@ async def compress_memory(key: str, gen: int) -> None:
         new_text = format_l0_for_compression(segment)
         if not new_text.strip():
             return  # 片段里没有任何可读内容（正常情况下不会发生）
+        # 本片段覆盖的日期：决定给模型看哪几天的已有流水（按片段取，不按"今天"取）
+        seg_days = _segment_days(segment)
 
         # 第二段：锁外调用模型（唯一的长耗时）
         # 顺序刻意把「新片段」放在前面：长上下文里靠后的内容更容易被忽略，
         # 而本轮真正需要处理的是新信息，旧记忆库只是合并的起点。
         # 今天日期必须给：模型要据此判断 event 的 exp 是否过期，这是它唯一的时间参照。
-        user_prompt = build_compress_user_prompt(new_text, old_facts, old_recent)
+        user_prompt = build_compress_user_prompt(new_text, old_facts, old_recent, seg_days)
         try:
             raw = await memory_llm(LM_COMPRESS_SYSTEM, user_prompt)
         except Exception as e:
