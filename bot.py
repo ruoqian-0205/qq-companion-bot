@@ -1656,10 +1656,10 @@ async def handle_scan_login() -> bool | None:
     # 1) 先让用户决定：默认手动重建凭证；选择直接扫码时才弹出二维码
     log.warning("=" * 60)
     log.warning("快速登录失败 —— 需要扫码登录。请选择：")
-    log.warning("  [Y/回车] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
-    log.warning("            （会结束 NapCat/QQ 进程并停止 bot.py）")
-    log.warning("            ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
-    log.warning("  [N]      就现在扫码登录（需要人工点授权，不支持无人值守）")
+    log.warning("  [Y] 先手动登录一次建立凭证，让「自动快速登录」以后能继续用")
+    log.warning("      （会结束 NapCat/QQ 进程并停止 bot.py）")
+    log.warning("      ⚠️ 若你平时不用 QQ 客户端，选这项可能让机器人再也无法自动上线")
+    log.warning("  [N] 就现在扫码登录（需要人工点授权，不支持无人值守）")
     log.warning("=" * 60)
     # 提示符用 print 手工输出（而不是 input 的内置 prompt）：
     # 内置 prompt 会在调用 input 的瞬间输出，容易与随后落下的日志挤在同一行；
@@ -2329,6 +2329,12 @@ async def main():
             log.warning("已停止 bot：请按提示手动登录以重建快速登录凭证，完成后重新运行 bot.py")
             clean_shutdown(force=True)   # 用户要手动重建凭证 → 无条件结束进程
             return
+        # 重登任务正在跑（含扫码交互）：NapCat 此时必然连不上，
+        # 反复尝试连接只会刷 ERROR 日志、还会把「请选择 [Y/n]」提示冲散。
+        # 安静等它结束再继续——成功就正常上线，失败会被上面的检查接住。
+        if relogin_task and not relogin_task.done():
+            await asyncio.sleep(3)
+            continue
         try:
             async with websockets.connect(WS_URL, ping_interval=20) as ws:
                 log.info("已连接 NapCat，机器人上线喵~")
