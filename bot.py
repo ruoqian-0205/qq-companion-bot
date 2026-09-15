@@ -18,7 +18,7 @@ import shutil
 import socket
 import atexit
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+import threading
 from copy import deepcopy
 
 load_dotenv()   # 读 .env
@@ -1581,15 +1581,39 @@ async def ensure_qr_page() -> None:
         log.error(f"生成二维码页面失败：{e}")
 
 
-# 扫码选择专用线程：asyncio 默认线程池只有 4 个槽，而扫码输入会长时间占用一个
-# （用户可能拖很久才回），与自愈里的 to_thread(_spawn_autologin_sync) 争抢，
-# 极端情况下会让后者排队、表现为"点了没反应"。单独开一个池隔离掉。
-_stdin_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stdin")
-
-
 async def _read_stdin_line() -> str:
-    """在线程池里读一行输入（阻塞调用，不能直接放在事件循环里）。"""
-    return await asyncio.get_running_loop().run_in_executor(_stdin_pool, sys.stdin.readline)
+    """在一个一次性 daemon 线程里读一行输入（阻塞调用，不能放在事件循环里）。
+
+    为什么不用线程池：`sys.stdin.readline` 一旦没有输入就永久阻塞，而
+    `asyncio.wait_for` 超时只取消协程、取消不了线程 —— 线程池里的线程是
+    non-daemon，会一直卡在 readline 上。解释器退出时
+    `wait_for_thread_shutdown()` 要 join 所有 non-daemon 线程，于是
+    "已停止 bot"之后进程永远不退出，连 atexit 的清理都轮不到执行
+    （实测：日志停在"已停止 bot"，进程却活着、CPU 接近 0、QQ/NapCat 已被杀）。
+    daemon 线程不参与 join，卡住也无所谓。
+    串行性由 scan_prompt_active 保证（同一时刻只会有一个扫码交互）。
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def set_ok(line: str) -> None:
+        if not fut.done():
+            fut.set_result(line)
+
+    def set_err(e: BaseException) -> None:
+        if not fut.done():
+            fut.set_exception(e)
+
+    def worker() -> None:
+        try:
+            line = sys.stdin.readline()
+        except Exception as e:          # stdin 已关闭等极端情况
+            loop.call_soon_threadsafe(set_err, e)
+        else:
+            loop.call_soon_threadsafe(set_ok, line)
+
+    threading.Thread(target=worker, daemon=True, name="stdin-read").start()
+    return await fut
 
 
 async def _read_scan_choice() -> str | None:
@@ -1691,15 +1715,21 @@ async def relogin_once(reason: str) -> bool:
     global relogin_failures, need_manual_recovery
     log.warning(f"检测到 NapCat 不可用（{reason}），开始自动重登")
 
-    # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入
-    try:
-        r = subprocess.run(["taskkill", "/f", "/im", "QQ.exe"],
-                           capture_output=True, text=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-        log.info(f"已结束 QQ.exe：{(r.stdout or r.stderr or '').strip()[:120]}")
-    except Exception as e:
-        log.error(f"结束 QQ.exe 失败：{e}")
-    await asyncio.sleep(3)   # 等进程真正退出，否则 launcher 可能复用旧实例
+    # 1) 结束 QQ.exe 整组进程：同一程序已有实例时，launcher 不会真正重启注入。
+    #    但端口根本没在监听时，说明 QQ 进程已经死了，taskkill 是多余的（还要白等 3 秒），
+    #    直接拉起即可。这个判断原本写在主循环那条分支里，现在收进来——
+    #    "拉起 QQ"只保留这一个入口，不再有两条路径各自拉起、互相 taskkill。
+    if napcat_port_open():
+        try:
+            r = subprocess.run(["taskkill", "/f", "/im", "QQ.exe"],
+                               capture_output=True, text=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            log.info(f"已结束 QQ.exe：{(r.stdout or r.stderr or '').strip()[:120]}")
+        except Exception as e:
+            log.error(f"结束 QQ.exe 失败：{e}")
+        await asyncio.sleep(3)   # 等进程真正退出，否则 launcher 可能复用旧实例
+    else:
+        log.info("QQ 进程已退出（端口未监听），跳过 taskkill 直接拉起")
 
     # 记下二维码时间戳：之后若它被更新，就说明快速登录失败、NapCat 已改用扫码
     qr_before = qr_file_mtime()
@@ -2268,6 +2298,16 @@ def clean_shutdown(force: bool = False) -> None:
             log.error(f"  结束 {img} 失败：{e}")
     log.info("清理完成。想重新上线请再次运行 python bot.py"
              "（已配置掉线自愈的话，它会自己快速登录拉起）")
+    if force:
+        # force=True 的语义是"停下来等你手动重建凭证"，此时必须真正结束进程。
+        # 不能只靠 return + 解释器自然退出：只要还有 non-daemon 线程卡着
+        # （比如读 stdin 的那个线程），解释器退出时会 join 它们并永远停住，
+        # 表现为"日志说已停止 bot，进程却一直活着"。该做的清理上面都做完了，
+        # 这里直接结束进程最稳妥（os._exit 不再触发 atexit，避免递归进来）。
+        log.warning("强制结束进程")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 async def main():
@@ -2317,42 +2357,12 @@ async def main():
             log.error(f"连接断开: {e}，5秒后重连...")
             if AUTO_RELOGIN and not relogin_failed:
                 relogin_failed = True
-                if not napcat_port_open():
-                    # NapCat 服务没在跑（QQ 进程已死）。它本身是注入进 QQ 的，
-                    # 所以"拉起 QQ"就能同时把 NapCat 带回来，不需要额外 taskkill。
-                    log.warning("NapCat 端口未监听（QQ 进程可能已退出），尝试直接快速登录拉起")
-                    err = await asyncio.to_thread(_spawn_autologin_sync)
-                    if err:
-                        log.error(f"快速登录无法执行：{err}")
-                    else:
-                        qr_before = qr_file_mtime()   # 拉起前的二维码时间戳，用于识别新图
-                        log.info(f"已触发快速登录，等待上线或新二维码（最多 {QR_DETECT_TIMEOUT} 秒）...")
-                        result = await wait_online_or_qr(QR_DETECT_TIMEOUT, qr_before)
-                        if result == "online":
-                            log.info("NapCat 已恢复，即将重连")
-                        elif result == "qr":
-                            # 快速登录失败：NapCat 已生成新二维码，立刻转入扫码流程
-                            log.warning("快速登录失败（已生成新二维码），转入扫码登录")
-                            scan_result = await handle_scan_login()
-                            if scan_result is None:
-                                # 另一个扫码交互在进行中；不要当成"已停止"直接退出，
-                                # 继续重连循环，等那边完成后自然恢复
-                                log.info("已有扫码交互在进行中，等待其结束")
-                            elif not scan_result:
-                                log.warning("已停止 bot，请按提示手动重建快速登录凭证")
-                                return
-                            else:
-                                log.info("扫码完成，即将重连")
-                        else:
-                            log.warning(f"{QR_DETECT_TIMEOUT} 秒内未见上线或新二维码，继续等待 ...")
-                            if await wait_online_recovery(RELOGIN_WAIT_SECONDS, 10):
-                                log.info("NapCat 已恢复，即将重连")
-                            else:
-                                log.error(f"{RELOGIN_WAIT_SECONDS} 秒内 NapCat 未恢复，"
-                                          "请检查 NapCat 与 QQ 登录状态")
-                else:
-                    # 端口在监听但连接被拒 → 多半是账号掉线，走"重启 QQ + 快速登录"
-                    _spawn_relogin("主连接断开")
+                # 统一交给 relogin_once：它内部会区分"QQ 进程已死（端口未监听）"
+                # 和"账号掉线（端口在监听）"，并且自带限流。
+                # 这里不再自己拉起并等待——那条路径会和巡检那条同时拉起、互相 taskkill
+                # （一边刚拉起 QQ，另一边又把它杀掉），还绕过了限流，
+                # 并且会把主循环阻塞在扫码交互上最长 SCAN_PROMPT_TIMEOUT 秒。
+                _spawn_relogin("主连接断开")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
