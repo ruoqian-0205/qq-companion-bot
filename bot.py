@@ -577,12 +577,16 @@ def load_long_memory():
         }
 
 def save_long_memory():
-    """写盘前轮转一份备份（.bak1 最新，最多保留 3 份）。
+    """写盘前轮转一份备份（.bak1 = 上一次的内容，最多保留 3 份）。
 
     事实库是整体重写的，一旦模型返回异常内容（例如空数组）就会把既有记忆
     全部覆盖掉，且无法从 git 恢复（该文件被 gitignore）。留备份用于事后找回。
+
+    顺序很关键：必须**先备份旧文件、再写新内容**。
+    原实现是先写盘、再把刚写好的文件复制成 .bak1，结果 .bak1 永远等于主文件、
+    完全没有备份价值（历史实际只剩 .bak2/.bak3 两份），而且主文件若写坏，
+    .bak1 里存的也是同一份坏数据。
     """
-    _atomic_write_json(LM_FILE, long_memories)
     try:
         if os.path.exists(LM_FILE):
             for i in (2, 1):
@@ -592,6 +596,7 @@ def save_long_memory():
             shutil.copy2(LM_FILE, f"{LM_FILE}.bak1")
     except Exception as e:
         log.warning(f"长期记忆备份失败（不影响本次保存）：{e}")
+    _atomic_write_json(LM_FILE, long_memories)
 
 def clear_long_memory(key: str) -> None:
     """彻底忘记某个会话：清 L0、清 L1、让在途压缩作废。调用方需持有该 key 的锁。"""
