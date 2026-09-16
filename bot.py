@@ -688,6 +688,7 @@ def build_system_content(key: str) -> str:
         "仅供你理解时间背景和对话先后顺序，大多数时候可以忽略，以更贴近真人闲聊的状态。"
         "你自己回复时绝对不要输出任何时间戳或类似格式的内容。"
         "\n- 你只能发文字和图片消息，无法发语音、打电话、打视频，也无法和对方在现实里见面。"
+        "\n- 你可以连续发送多条消息。"
         "\n- 所有事件、信息只能根据已有信息判断，不得无中生有。"
         "\n- 你的每条回复都应该完全自然，像真人在QQ上聊天一样，不包含任何元信息或格式标记。"
     )
@@ -1205,9 +1206,10 @@ async def update_persona(old_persona: str, facts: list, recent: dict,
         f"【最近几天】\n{format_recent_for_prompt(recent)}\n\n"
         f"【你们最近说过的话】\n{dialog_tail}\n\n"
         f"【你上次写下的心事】\n{old_persona or '（还没有）'}\n\n"
-        f"把心事重新写一遍，{max(100, LM_PERSONA_MAX_CHARS // 2)}~{LM_PERSONA_MAX_CHARS} 字。\n"
+        f"重写一份心事，{max(100, LM_PERSONA_MAX_CHARS // 2)}~{LM_PERSONA_MAX_CHARS} 字。\n"
         "写你在相处里形成的偏好、你注意到的自己的变化、你没说出口的心事、你的情愫、你隐秘的欲望。\n"
         "不要复述他说过什么——写你因此变成了什么样。\n"
+        "不要照搬照抄上一次的心事。\n"
         "直接写正文，不要标题、不要分点。"
     )
     # 输出预算跟着心事上限走：中文 1 字约 1.5~2 token，再留出思考模式的推理额度。
