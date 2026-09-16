@@ -364,18 +364,30 @@ def split_reply(reply: str) -> list[str]:
     if not reply:
         return []
     if not SPLIT_REPLY_ENABLED:
-        one = clean_reply(reply)
+        # 不拆分时也要**逐段**清理：模型有时整段输出每条都带 [时间戳] 前缀，
+        # 而 clean_reply 只清整段开头，后面每一段的都会留下。
+        segs = [clean_reply(p) for p in re.split(r"\n\s*\n", reply)]
+        one = "\n\n".join(s for s in segs if s)
         return [one] if one else []
+
     parts = [p.strip() for p in re.split(r"\n\s*\n", reply)]
     parts = [p for p in parts if p]
     if not parts:
         return []
+
+    # 顺序很关键：**先逐条清理，再合并**。
+    # 反过来的话，被合并的那些段会接到「……」后面，它们的开头前缀就不再是
+    # 整行的开头，而 clean_reply 只清开头 —— 第 10 条往后的时间戳会留在消息里。
+    parts = [clean_reply(p) for p in parts]
+    parts = [p for p in parts if p]
+    if not parts:
+        return []
+
     if len(parts) > SPLIT_REPLY_MAX:
         head = parts[:SPLIT_REPLY_MAX - 1]
         merged = "……".join(parts[SPLIT_REPLY_MAX - 1:])
         parts = head + [merged]
-    cleaned = [clean_reply(p) for p in parts]
-    return [c for c in cleaned if c]
+    return parts
 
 # ---------- 记忆读写 ----------
 def _atomic_write_json(path: str, data) -> None:
