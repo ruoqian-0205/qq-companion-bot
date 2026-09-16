@@ -1465,12 +1465,20 @@ async def chat_with_deepseek(key: str, msgs: list[dict]) -> tuple[str, bool]:
             messages=msgs,
             temperature=1.3,
             top_p=0.9,
-            max_tokens=500,
+            # 预算是「思考 + 正文」的总和。实测单条约 50~65 token，而 split_reply_max
+            # 允许连发 10 条，加推理后 500 会在 6~7 条时就顶到上限。
+            # max_tokens 只是上限、按实际输出计费，调大不增加成本，只降低"话说一半被截断"的概率。
+            max_tokens=1200,
             extra_body={"thinking": {"type": "enabled" if ENABLE_THINKING else "disabled"}},
         )
-        reply = clean_reply((resp.choices[0].message.content or "").strip())
+        ch = resp.choices[0]
+        reply = clean_reply((ch.message.content or "").strip())
         if not reply:
             raise ValueError("模型返回了空内容")
+        if ch.finish_reason == "length":
+            # 撞上限：已生成的部分照常发送（真人也会话说一半），但留一条日志——
+            # 若持续出现，说明 1200 仍不够，需要继续调大。
+            log.warning("回复被 max_tokens 截断（finish_reason=length），已发送已生成的部分")
         return reply, True
     except Exception as e:
         log.error(f"DeepSeek 调用失败: {e}")
