@@ -144,8 +144,8 @@ LM_RECENT_MAX_ITEMS = CFG.get("lm_recent_max_items", 200)    # 条数保护上�
 # 同时也要防止模型把它写成流水账——心事本该是凝练的。
 LM_PERSONA_MAX_CHARS = CFG.get("lm_persona_max_chars", 400)
 
-# ---- 多段回复（模型用空行分隔时，按段依次发送多条消息）----
-# 模型可以用「连续两个换行」把一次回复分成多条短消息，更接近真人在 QQ 上连发几条。
+# ---- 多段回复（模型用换行分隔时，按段依次发送多条消息）----
+# 模型用换行表示"再发一条"，一次回复变成先后几条短消息，更接近真人在 QQ 上连发几句。
 SPLIT_REPLY_ENABLED = CFG.get("split_reply_enabled", True)
 SPLIT_REPLY_MAX = CFG.get("split_reply_max", 10)                    # 最多拆成几条，超出合并到最后一条
 SPLIT_REPLY_INTERVAL = tuple(CFG.get("split_reply_interval", [0.5, 1.5]))   # 每条之间的随机间隔(秒)
@@ -355,22 +355,27 @@ def clean_reply(text: str) -> str:
 
 
 def split_reply(reply: str) -> list[str]:
-    """把模型的回复按「连续空行」拆成多条消息，每条单独 clean_reply。
+    """把模型的回复按「换行」拆成多条消息，每条单独清理前缀。
 
-    模型可以用空行把一次回复分成几条短消息，更接近真人在 QQ 上连发。
-    注意只按"连续两个换行"（中间允许空白）分割，单个换行保留。
+    模型用换行表示"再发一条"，一次回复就变成先后几条短消息，更接近真人在 QQ 上连发。
+    **单个换行就算分条**；连续多个换行视为一个分隔，所以空行写法同样兼容。
+    模型两种写法都会出现：空行分隔原先就能正确拆开，单换行时两句却会挤进同一条气泡，
+    而且第二行往后的 [时间戳] 前缀会残留（clean_reply 只清整段开头）。
+    统一按换行切分后，两种写法都能拆开，前缀也不会再残留。
+    注意切分之后每一段内部都不会再有换行，所以在段上直接调 clean_reply 就够了，
+    不需要再按行清一遍。
     超过 SPLIT_REPLY_MAX 条时，把多余部分合并到最后一条（避免越拆越多）。
     """
     if not reply:
         return []
     if not SPLIT_REPLY_ENABLED:
-        # 不拆分时也要**逐段**清理：模型有时整段输出每条都带 [时间戳] 前缀，
-        # 而 clean_reply 只清整段开头，后面每一段的都会留下。
-        segs = [clean_reply(p) for p in re.split(r"\n\s*\n", reply)]
-        one = "\n\n".join(s for s in segs if s)
+        # 不拆分也要先按换行切段清理，否则第二行往后的 [时间戳] 会留下来。
+        # 清完再拼回一条发出——"不拆分"只是不分成多条发，不是不切分。
+        segs = [clean_reply(p) for p in re.split(r"\n+", reply)]
+        one = "\n".join(s for s in segs if s)
         return [one] if one else []
 
-    parts = [p.strip() for p in re.split(r"\n\s*\n", reply)]
+    parts = [p.strip() for p in re.split(r"\n+", reply)]
     parts = [p for p in parts if p]
     if not parts:
         return []
@@ -2121,7 +2126,7 @@ async def send_assistant_reply(ws, text: str,
                                uid: int | None = None,
                                gid: int | None = None,
                                at_qq: int | None = None) -> list[str]:
-    """把回复按空行拆分后依次发送，返回**已成功送达**的段。
+    """把回复按换行拆分后依次发送，返回**已成功送达**的段。
 
     调用方据此决定写入记忆的内容：只记真正发出去的，避免"没送达却被当成说过了"。
     多段之间加随机延迟，一是更像真人打字，二是避免连续发送触发风控。
@@ -2227,7 +2232,7 @@ async def handle_message(ws, data: dict):
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
         # 阶段 3：先发送、确认送达后才写记忆 —— 送不出去的话不该被当成"已经说过"
-        # 回复可能含空行分隔的多段，逐条发送；只把成功送达的段记进 L0
+        # 回复可能含换行分隔的多条，逐条发送；只把成功送达的段记进 L0
         sent_parts = await send_assistant_reply(ws, reply, uid=uid)
         if sent_parts:
             async with get_mem_lock(key):
