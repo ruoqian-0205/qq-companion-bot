@@ -787,13 +787,17 @@ def group_reply_probability(gid: int, mentioned: bool, text: str, nickname: str)
 
 # ---------- 生成系统提示（私聊/群聊区分） ----------
 def _is_inner_key(key: str) -> bool:
-    """该会话是否属于里人格账号。
+    """该会话是否**真正**在用里人格。
 
-    群聊 key 形如 "g:123"，私聊 key 就是纯 uid 字符串，用 isdigit 即可把群聊排除。
-    这里刻意**不看** PERSONA_INNER 是否为空：人格文件缺失时该回落表人格，
-    但"这个账号属于里人格名单"这件事本身没变。
+    两个条件缺一不可：里人格文件已加载成功，且该账号在里人格名单里。
+
+    只看名单是不够的：里人格不可用时（文件缺失，或者临时想切回表人格、却偷懒没把
+    账号从 inner_accounts 挪走）人格正文已经回落表人格，固定回复若还留着里人格那套，
+    就会一身两调、比全套表人格更出戏。人格与固定回复必须同进同退。
+
+    群聊 key 形如 "g:123"，私聊 key 就是纯 uid 字符串，用 isdigit 即可排除群聊。
     """
-    return key.isdigit() and int(key) in PERSONA_INNER_ACCOUNTS
+    return bool(PERSONA_INNER) and key.isdigit() and int(key) in PERSONA_INNER_ACCOUNTS
 
 
 def fallback_reply_for(key: str) -> str:
@@ -813,9 +817,7 @@ def persona_for(key: str) -> str:
     所以这里用 isdigit 把群聊排除在外。"里人格未配置"时 PERSONA_INNER 是空串，
     自然回落到表人格。
     """
-    if PERSONA_INNER and _is_inner_key(key):
-        return PERSONA_INNER
-    return PERSONA_OUTER
+    return PERSONA_INNER if _is_inner_key(key) else PERSONA_OUTER
 
 
 def build_system_content(key: str) -> str:
