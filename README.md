@@ -21,7 +21,7 @@
 | **主动打招呼** | 空闲时随机发起开场白,私聊/群聊可分别配置;带**聊天避让**(最近在对话就不打扰) |
 | **掉线自愈** | 账号被踢下线或 QQ 进程退出时,**自动无黑窗快速登录**把机器人拉回线上 |
 | **消息送达保障** | 生成前检查在线状态(省 token);发送后等回执,**没送达就不写记忆** |
-| **人设系统** | 主人格 `persona.txt` + 私密人格 `me.txt` 双份独立维护,支持 `{bot_name}` 占位符;私密人格只对私密私聊白名单生效 |
+| **人设系统** | 表人格 `persona.txt` + 里人格 `me.txt` 双份独立维护,支持 `{bot_name}` 占位符;里人格只对 `persona.inner_accounts` 生效 |
 | **静音时段** | 可配置北京时间凌晨时段不主动打扰 |
 | **调试模式** | `python bot.py --debug` 在终端测试人设与回复,不连 QQ |
 
@@ -71,7 +71,7 @@ VISION_API_KEY=你的阿里云DashScope密钥
 cp config.example.json config.json
 ```
 
-至少修改:`bot_qq`(机器人 QQ 号)、`private_whitelist`(允许私聊的 QQ 号)、`group_whitelist`(允许发言的群号)。
+至少修改:`bot.qq`(机器人 QQ 号)、`whitelist.private`(允许私聊的 QQ 号)、`whitelist.group`(允许发言的群号)。
 
 ### 5. 配置人设
 
@@ -79,7 +79,7 @@ cp config.example.json config.json
 cp persona.example.txt persona.txt
 ```
 
-`{bot_name}` 会被替换为 `bot_name` 的值。
+`{bot_name}` 会被替换为 `bot.name` 的值。
 
 ### 6. (可选)配置掉线自愈
 
@@ -100,117 +100,136 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 ## ⚙️ 配置详解(config.json)
 
-### 基础
+配置按功能分成九组。**每组都可省略**——只写你想改的项，没写的自动用代码里的默认值
+（只有 `bot.qq`、`model.text_base_url` / `model.text_model` / `model.vision_base_url` / `model.vision_model`
+和 `persona.outer_file` 没有默认值，必须写）。
+
+### `bot` — 身份与通用回复
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `bot_name` | `小深` | 机器人名字,替换人设中的 `{bot_name}` |
-| `persona_file` | `persona.txt` | 主人格文件路径(也可用 `persona` 字段内联);缺失则报错退出 |
-| `private_persona_file` | `me.txt` | 私密人格文件路径;为空/读不到则回落主人格 |
-| `private_persona_whitelist` | `[]` | 私密私聊白名单(这些账号不要写进 `private_whitelist`) |
-| `ws_url` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
-| `bot_qq` | — | 机器人 QQ 号 |
-| `private_whitelist` | `[]` | 私聊白名单 |
-| `group_whitelist` | `[]` | 群聊白名单 |
+| `qq` | — | 机器人 QQ 号(**必填**) |
+| `name` | `小深` | 机器人名字,替换人设中的 `{bot_name}` |
 | `reply_probability` | `0.7` | 私聊回复概率 |
 | `fallback_reply` | `喵……刚才网络开小差了，再说一次好不好？` | 模型调用失败时的兜底回复 |
 | `clear_memory_reply` | `喵~ 记忆已经清空啦，我们重新开始吧！` | 执行"清空记忆"后的回复 |
 
-### 模型
+### `model` — 文本与视觉模型
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `text_base_url` | `https://api.deepseek.com` | 文本模型接口地址 |
-| `text_model` | `deepseek-flash` | 文本模型名 |
-| `enable_thinking` | `true` | 是否开启思考模式(见 [思考模式](#-思考模式enable_thinking)) |
-| `vision_base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 视觉模型接口地址 |
-| `vision_model` | `qwen3.7-flash` | 视觉模型名 |
+| `text_base_url` | — | 文本模型接口地址(**必填**) |
+| `text_model` | — | 文本模型名(**必填**) |
+| `thinking` | `true` | 是否开启思考模式(见 [思考模式](#-思考模式modelthinking)) |
+| `vision_base_url` | — | 视觉模型接口地址(**必填**) |
+| `vision_model` | — | 视觉模型名(**必填**) |
 | `max_images_per_message` | `3` | 单条消息最多识别几张图 |
 
-### 群聊
+### `persona` — 表人格 / 里人格
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `group_at_only` | `true` | 是否仅在被 @ 时回复 |
-| `group_reply_probability` | `0.8` | 被 @ 时的回复概率 |
-| `group_keyword_probability` | `0.7` | 命中关键词时的回复概率 |
-| `group_active_probability` | `0.6` | 活跃期内的回复概率 |
-| `group_default_probability` | `0.1` | 默认(潜水)时的回复概率 |
-| `group_active_window` | `600` | 活跃期时长(秒) |
-| `group_max_consecutive_replies` | `5` | 活跃期内最多连续回复条数 |
+| `outer_file` | — | **表人格**文件路径(**必填**,缺失则报错退出) |
+| `inner_file` | `""` | **里人格**文件路径;为空/读不到/内容为空 → 回落表人格并告警 |
+| `inner_accounts` | `[]` | 使用里人格的私聊账号(**不要**同时写进 `whitelist.private`) |
+
+### `whitelist` — 准入名单
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `private` | `[]` | 私聊白名单(用**表人格**) |
+| `group` | `[]` | 群聊白名单 |
+
+### `group_chat` — 群聊行为
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `at_only` | `true` | 是否仅在被 @ 时回复 |
+| `reply_probability` | `0.8` | 被 @ 时的回复概率 |
+| `keyword_probability` | `0.7` | 命中关键词时的回复概率 |
+| `active_probability` | `0.6` | 活跃期内的回复概率 |
+| `default_probability` | `0.1` | 默认(潜水)时的回复概率 |
+| `active_window` | `600` | 活跃期时长(秒) |
+| `max_consecutive_replies` | `5` | 活跃期内最多连续回复条数 |
 | `keywords` | `["小深", "猫娘"]` | 触发回复的关键词 |
 
-### 主动消息与静音时段
+### `proactive` — 主动消息
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `proactive_interval_private` | `[1800, 7200]` | 私聊主动消息间隔范围(秒),随机取值 |
-| `proactive_interval_group` | `[10800, 21600]` | 群聊主动消息间隔范围(秒) |
-| `proactive_to_each` | `0.5` | 每轮对每个对象发起主动消息的概率 |
-| `proactive_quiet_private` | `60` | 私聊静默期(秒):最近这么久内聊过就不主动打扰 |
-| `proactive_quiet_group` | `300` | 群聊静默期(秒) |
-| `enable_silent_hours` | `true` | 是否启用静音时段 |
-| `silent_hours_start` / `silent_hours_end` | `0` / `10` | 静音时段起止(小时,北京时间) |
+| `interval_private` | `[1800, 7200]` | 私聊主动消息间隔范围(秒),随机取值 |
+| `interval_group` | `[10800, 21600]` | 群聊主动消息间隔范围(秒) |
+| `to_each` | `0.5` | 每轮对每个对象发起主动消息的概率 |
+| `quiet_private` | `60` | 私聊静默期(秒):最近这么久内聊过就不主动打扰 |
+| `quiet_group` | `300` | 群聊静默期(秒) |
 
-### 记忆
+### `memory` — L0 对话窗口与多段回复
 
 | 配置项 | 默认值                | 说明 |
 |---|--------------------|---|
-| `memory_file` | `memory.json`      | 对话记忆文件(自动生成,勿手动编辑) |
-| `long_memory_enabled` | `true`             | 是否启用私聊长期记忆 |
-| `lm_file` | `memory_long.json` | 长期记忆文件:事实 + 心事 + 流水(自动生成) |
-| `lm_l0_max` | `260`              | L0 超过多少条时处理一次(**私聊与群聊共用同一参数**) |
-| `lm_compress_count` | `120`              | 每次处理掉最早多少条(须为偶数,且 ≤ `lm_l0_max` 的一半);私聊压进 L1,群聊直接丢弃 |
-| `lm_compress_delay` | `3`                | 触发后延迟几秒再整理(合并连续消息,避开回复请求) |
-| `lm_l1_max_facts` | `60`               | 事实库整库**条目数**上限(须 ≥ 三个桶配额之和,否则拒绝启动) |
-| `lm_l1_type_quota` | `who 20 / us 24 / event 16` | 各桶参考上限,防止某一桶把总配额吃光 |
-| `lm_l1_inject_hard_limit` | `200`        | 注入保险丝:超过这么多条就截断(正常永远碰不到) |
-| `lm_recent_days` | `3`                | 近期流水保留最近几个聊过的日子(按记录日整天淘汰,不按自然日) |
-| `lm_recent_max_items` | `200`          | 近期流水的条数保护上限 |
-| `lm_persona_max_chars` | `400`          | 「心事」字数上限(每轮都注入,是固定成本;改大时输出预算会自动跟上) |
-| `lm_l0_hard_limit` | `480`              | 私聊 L0 兜底硬上限(仅当压缩持续失败时生效,默认 `lm_l0_max` × 3) |
-| `lm_thinking` | `true`             | 整理记忆时是否开启思考(建议开启) |
-| `lm_max_tokens` | `16000`            | 整理调用的输出上限(开启思考时推理也占额度,**勿调太低**) |
-| `log_file_enabled` | `true`            | 是否把 WARNING 及以上日志落盘 |
-| `log_file` | `bot_error.log`     | 错误日志文件名(相对 bot.py,1MB × 3 轮转) |
+| `file` | `memory.json`      | 对话记忆文件(自动生成,勿手动编辑) |
+| `split_reply.enabled` | `true`             | 是否把一次回复按换行拆成多条依次发送 |
+| `split_reply.max` | `10`               | 最多拆成几条,超出部分用「……」合并到最后一条 |
+| `split_reply.interval` | `[0.5, 1.5]`       | 每条之间的随机间隔(秒),更像真人打字 |
 
-### 多段回复(连发多条)
+模型用**换行**表示"再发一条",一次回复就分成先后几条短消息逐条发送(每条单独清理时间戳/昵称前缀)。**单个换行即分条**,连续多个换行视为一个分隔,所以旧式的空行写法同样兼容;超过 `split_reply.max` 条时,末尾若干条会用「……」合并成一条。只有成功送达的段才会写入记忆 —— 部分失败时不会把没发出去的内容记成"已经说过"。
 
-| 配置项 | 默认值          | 说明 |
-|---|--------------|---|
-| `split_reply_enabled` | `true`       | 模型用换行分隔回复时,是否拆成多条依次发送 |
-| `split_reply_max` | `10`         | 最多拆成几条,超出部分合并到最后一条 |
-| `split_reply_interval` | `[0.5, 1.5]` | 每条之间的随机间隔(秒),更像真人打字 |
+### `long_memory` — L1 长期记忆(仅私聊)
 
-模型用**换行**表示"再发一条",一次回复就分成先后几条短消息逐条发送(每条单独清理时间戳/昵称前缀)。**单个换行即分条**,连续多个换行视为一个分隔,所以旧式的空行写法同样兼容;超过 `split_reply_max` 条时,末尾若干条会用「……」合并成一条。只有成功送达的段才会写入记忆 —— 部分失败时不会把没发出去的内容记成"已经说过"。
+| 配置项 | 默认值                | 说明 |
+|---|--------------------|---|
+| `enabled` | `true`             | 是否启用私聊长期记忆 |
+| `file` | `memory_long.json` | 长期记忆文件:事实 + 心事 + 流水(自动生成) |
+| `l0_max` | `260`              | L0 超过多少条时处理一次(**私聊与群聊共用同一参数**) |
+| `compress_count` | `120`              | 每次处理掉最早多少条(须为偶数,且 ≤ `l0_max` 的一半);私聊压进 L1,群聊直接丢弃 |
+| `compress_delay` | `3`                | 触发后延迟几秒再整理(合并连续消息,避开回复请求) |
+| `l1_max_facts` | `60`               | 事实库整库**条目数**上限(须 ≥ 三个桶配额之和,否则拒绝启动) |
+| `l1_type_quota` | `who 20 / us 24 / event 16` | 各桶参考上限,防止某一桶把总配额吃光 |
+| `l1_inject_hard_limit` | `200`        | 注入保险丝:超过这么多条就截断(正常永远碰不到) |
+| `recent_days` | `3`                | 近期流水保留最近几个聊过的日子(按记录日整天淘汰,不按自然日) |
+| `recent_max_items` | `200`          | 近期流水的条数保护上限 |
+| `persona_max_chars` | `400`          | 「心事」字数上限(每轮都注入,是固定成本;改大时输出预算会自动跟上) |
+| `l0_hard_limit` | `l0_max × 3`       | L0 兜底硬上限(仅当压缩持续失败时生效) |
+| `thinking` | 跟随 `model.thinking` | 整理记忆时是否开启思考(建议开启) |
+| `max_tokens` | `16000`            | 整理调用的输出上限(开启思考时推理也占额度,**勿调太低**) |
 
-### 掉线自愈
+### `runtime` — 连接、静音时段与日志
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `auto_relogin` | `true` | 账号掉线时是否自动快速登录 |
-| `qq_client_path` | `D:\Tencent\QQNT\QQ.exe` | 本机 QQ 客户端路径 |
-| `autologin_script` | `napcat-autologin.bat` | 快速登录脚本(相对路径则相对 bot.py 所在目录) |
-| `health_check_interval` | `30` | 在线巡检间隔(秒) |
-| `relogin_wait_seconds` | `180` | 触发重登后等待上线的最长时间(秒) |
+| `ws_url` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
+| `silent_hours.enabled` | `true` | 是否启用静音时段 |
+| `silent_hours.start` / `.end` | `0` / `10` | 静音时段起止(小时,北京时间) |
+| `log_file_enabled` | `true` | 是否把 WARNING 及以上日志落盘 |
+| `log_file` | `bot_error.log`     | 错误日志文件名(相对 bot.py,1MB × 3 轮转) |
+
+### `backend` — 后端进程与掉线自愈
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `auto_relogin` | `true` | 是否启用掉线自愈 |
+| `qq_client_path` | `D:\Tencent\QQNT\QQ.exe` | QQ 客户端路径 |
+| `autologin_script` | `napcat-autologin.bat` | 快速登录脚本(相对 bot.py) |
+| `health_check_interval` | `30` | 看门狗巡检间隔(秒) |
+| `relogin_wait_seconds` | `180` | 触发后等待上线的最长时间(秒) |
 | `relogin_max_per_hour` | `2` | 每小时最多自动重登次数 |
-| `kill_qq_on_exit` | `true` | 停止 bot.py 时是否一并结束 QQ / NapCat 进程(见下方说明) |
-| `qrcode_image` | `D:\tools\NapCat\cache\qrcode.png` | 需要扫码时使用的二维码图片路径 |
-| `qrconsole_log` | `napcat-autologin.log` | 快速登录脚本的输出日志(用于提取二维码链接) |
-| `qr_detect_timeout` | `20` | 触发快速登录后,等"上线或出现新二维码"的秒数 |
-| `scan_prompt_timeout` | `300` | 扫码选择的最长等待秒数(超时后自动安全退出,见下方说明) |
+| `qrcode_image` | — | 需要扫码时的二维码图片路径 |
+| `qrconsole_log` | `napcat-autologin.log` | 含二维码 URL 的控制台日志路径 |
+| `qr_detect_timeout` | `20` | 触发快速登录后等待"上线或新二维码"的窗口(秒) |
+| `scan_prompt_timeout` | `300` | 扫码选择的最长等待时间(秒),`0` = 永远等待 |
+| `kill_qq_on_exit` | `true` | 停止 bot.py 时是否一并结束 QQ / NapCat |
 
 ## 🧩 核心机制
 
-### 💭 思考模式(`enable_thinking`)
+### 💭 思考模式(`model.thinking`)
 
 `deepseek-flash` 默认开启思考模式:回复前先输出思维链,回答更周到自然,代价是**每轮多花约 70~120 个推理 token**。
 
-⚠️ **思考模式下 `temperature` / `presence_penalty` / `frequency_penalty` 不生效** —— 传了不报错,但会被忽略。所以项目里的 `temperature=1.3` 只在 `enable_thinking: false` 时才真正起作用。
+⚠️ **思考模式下 `temperature` / `presence_penalty` / `frequency_penalty` 不生效** —— 传了不报错,但会被忽略。所以项目里的 `temperature=1.3` 只在 `model.thinking: false` 时才真正起作用。
 
-记忆整理由 `lm_thinking` 单独控制(默认跟随)。**建议保持开启**:实测开启思考后,整理能正确区分"已撤销/已放弃"与"仍有效"的事件,也不会漏掉生日、家人健康这类重要信息。
+记忆整理由 `long_memory.thinking` 单独控制(默认跟随)。**建议保持开启**:实测开启思考后,整理能正确区分"已撤销/已放弃"与"仍有效"的事件,也不会漏掉生日、家人健康这类重要信息。
 
-> ⚠️ 开启思考时必须给足 `lm_max_tokens`(默认 16000):推理 token 也计入该额度,设得太小(实测 8000)会导致推理吃光额度、返回空内容,整理直接失败。
+> ⚠️ 开启思考时必须给足 `long_memory.max_tokens`(默认 16000):推理 token 也计入该额度,设得太小(实测 8000)会导致推理吃光额度、返回空内容,整理直接失败。
 
 ### 🗃️ 长期记忆(仅私聊)
 
@@ -218,7 +237,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 | 层 | 存储位置 | 内容 | 更新方式 |
 |---|---|---|---|
-| **L0 对话窗口** | `memory.json` | 最近若干条原始对话(带时间戳) | 持续追加;私聊与群聊共用 `lm_l0_max`,私聊压缩进 L1、群聊直接丢弃 |
+| **L0 对话窗口** | `memory.json` | 最近若干条原始对话(带时间戳) | 持续追加;私聊与群聊共用 `long_memory.l0_max`,私聊压缩进 L1、群聊直接丢弃 |
 | **L1 事实库** | `memory_long.json` → `facts` | 三个桶的长期事实 | **整体重写**(带覆盖防护) |
 | **L1 心事** | `memory_long.json` → `persona` | 相处中长出的偏好、自我觉察、没说出口的欲望 | **整体重写**,独立角色内省调用 |
 | **近期流水** | `memory_long.json` → `recent` | 最近几天的日常 | **增量追加**,代码按记录日淘汰 |
@@ -227,13 +246,13 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 ```
 聊天中 → 消息持续写入 L0
-      → L0 超过 lm_l0_max(默认 260 条)
+      → L0 超过 long_memory.l0_max(默认 260 条)
       ├─ 私聊
-      │    → 延迟 lm_compress_delay 秒,把最早的 lm_compress_count 条 + 现有事实库交给模型整理
+      │    → 延迟 long_memory.compress_delay 秒,把最早的 long_memory.compress_count 条 + 现有事实库交给模型整理
       │    → 先写回事实库,再从 L0 删掉这些消息(最坏只是重复整理,不会丢消息)
       │    → 紧接着用「压缩后的 facts + 合并后的流水 + 裁剪后剩余的 L0」再调一次模型,重写 persona
       └─ 群聊
-           → 直接丢弃最早的 lm_compress_count 条(不调模型、不写入 L1)
+           → 直接丢弃最早的 long_memory.compress_count 条(不调模型、不写入 L1)
 ```
 
 > **为什么是"攒够一批再截断",而不是每条都滑窗?**
@@ -269,7 +288,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 **心事的定位:人设文件是出厂设定,`persona` 是相处到如今她成了谁。**
 两者都关于她,但一个说"你是…"(定义)、一个说"我成了…"(内心)。
 它由**独立的一次角色内省调用**生成:注入原人格让她进入角色、输入关系现状与最近对话、
-强调"延续不是重来"(否则每次都会写成另一个人)。字数上限 `lm_persona_max_chars`(默认 400)。
+强调"延续不是重来"(否则每次都会写成另一个人)。字数上限 `long_memory.persona_max_chars`(默认 400)。
 
 **近期流水为什么要单独一层:** L0 只覆盖最近几小时,而事实库只记稳定属性,
 中间"最近聊过些什么"没有归宿——模型于是对昨天的事一无所知。`recent` 补的就是这一段。
@@ -282,7 +301,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 |---|---|---|
 | `who` / `us` / `persona` | 模型 | 被新信息取代 / 整段重写 |
 | `event` | 模型 | 语句里的时间点 + `seen`(多久没提) + `n`(提过几次) |
-| `recent` | **代码** | 保留最近 `lm_recent_days` 个记录日,超条数上限整天淘汰 |
+| `recent` | **代码** | 保留最近 `long_memory.recent_days` 个记录日,超条数上限整天淘汰 |
 | 整库超限时 | 模型 | 先删超出自身配额的那一桶,再删 `n` 最小、`seen` 最老的 |
 
 **语义性淘汰(取代、合并、改写)交给模型,时间性淘汰(流水滚动)交给代码。**
@@ -323,7 +342,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
   会触发第二次压缩,两个任务都基于同一份**旧**事实库各算一遍,后提交的会把先提交的覆盖掉。
 - persona 的素材(关系现状 / 流水 / 对话)**在锁内定格成快照**再拿到锁外调模型,
   否则读到的是"半新半旧"的状态。
-- **兜底硬上限** `lm_l0_hard_limit`(默认 `lm_l0_max` × 3):正常压缩在 `lm_l0_max` 就收口,
+- **兜底硬上限** `long_memory.l0_hard_limit`(默认 `long_memory.l0_max` × 3):正常压缩在 `long_memory.l0_max` 就收口,
   这个上限只在压缩持续失败(如 API 长期故障)时生效,避免上下文无限膨胀。
   触发时会打一条日志说明"压缩持续失败,请检查 API 与配置"。
 
@@ -331,7 +350,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 主动消息到点时如果**刚好还在聊天**,直接冒一句开场白会明显出戏。程序为此记录每个会话的最后活动时间:
 
-- 距上次对话不足 `proactive_quiet_private`(私聊 60 秒)/ `proactive_quiet_group`(群聊 300 秒)→ **跳过本次**
+- 距上次对话不足 `proactive.quiet_private`(私聊 60 秒)/ `proactive.quiet_group`(群聊 300 秒)→ **跳过本次**
 - 按会话**独立判断**:A 正在聊天不影响给 B 发主动消息
 - 群聊的"正在聊天"按**任何群消息**计算(不只是 @ 或需要回复的)
 - 两个值设为 `0` 可关闭该机制
@@ -345,7 +364,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 | 检测方式 | 触发时机 | 覆盖的情况 |
 |---|---|---|
 | 主连接断开 | WebSocket 一断即触发(约 5 秒) | QQ 进程死了 / NapCat 崩了 |
-| 定期巡检 | 每 `health_check_interval` 秒 | 连接还在、但**账号已离线**(被踢) |
+| 定期巡检 | 每 `backend.health_check_interval` 秒 | 连接还在、但**账号已离线**(被踢) |
 
 **两种处理方式:**
 
@@ -403,7 +422,7 @@ exit /b 0
 
 因此无人值守时不会一直卡在"请选择 Y/n"上,也不会让 QQ 进程一直占着登录会话(否则你在手机或别处登同一个号会被顶下线)。把该值设为 `0` 表示永远等待,适合纯人工值守的场景。
 
-**安全边界:** 需要扫码时无法自动恢复(账号侧限制);每小时最多重登 `relogin_max_per_hour` 次,失败按 1/5/15 分钟退避,避免"重启→被踢→再重启"死循环;设 `auto_relogin: false` 可关闭。
+**安全边界:** 需要扫码时无法自动恢复(账号侧限制);每小时最多重登 `backend.relogin_max_per_hour` 次,失败按 1/5/15 分钟退避,避免"重启→被踢→再重启"死循环;设 `backend.auto_relogin: false` 可关闭。
 
 ### 🛑 安全停止
 
@@ -412,7 +431,7 @@ exit /b 0
 - **Ctrl+C** 停止 → 通过 `atexit` 钩子结束 `QQ.exe` 与 `NapCatWinBootMain.exe`
 - **扫码流程选 Y** → 无条件清理(因为就是要手动重建凭证)
 - 日志会打印结束了几个进程
-- 不想让它动 QQ 客户端?把 `kill_qq_on_exit` 设为 `false`
+- 不想让它动 QQ 客户端?把 `backend.kill_qq_on_exit` 设为 `false`
 
 下次运行 `python bot.py` 时会自动快速登录重新拉起,无需手动准备。
 
@@ -456,7 +475,7 @@ A: 确认已创建 `.env` 并填好两个 Key;确认当前目录就是项目根�
 
 **Q: 日志一直显示连接断开/重连**
 
-A: 确认 NapCat 已开启 WebSocket 服务端(正向)且端口与 `ws_url` 一致(默认 `3001`);若已配置掉线自愈,程序会尝试自动拉起,失败时看日志提示。
+A: 确认 NapCat 已开启 WebSocket 服务端(正向)且端口与 `runtime.ws_url` 一致(默认 `3001`);若已配置掉线自愈,程序会尝试自动拉起,失败时看日志提示。
 
 **Q: 收到图片不识别或显示"图片加载失败"**
 
@@ -468,7 +487,7 @@ A: (1) **省 token** —— 一张图若按原图塞进后续每轮对话最多�
 
 **Q: 群聊里机器人不回复**
 
-A: 确认群号在白名单、`group_at_only` 与回复概率符合预期;概率机制下部分消息会故意不回复,这是特性不是 Bug。
+A: 确认群号在白名单、`group_chat.at_only` 与回复概率符合预期;概率机制下部分消息会故意不回复,这是特性不是 Bug。
 
 **Q: 回复开头带 `[时间戳]` 或 `小深:` 前缀**
 
@@ -476,7 +495,7 @@ A: 程序已内置前缀清理逻辑,并且按换行拆分后**逐条清理**,�
 
 **Q: 长期记忆什么时候触发?会不会很费钱?**
 
-A: 只有私聊、且对话累积到 `lm_l0_max`(默认 260 条)时才整理一次,**整理次数 ≈ 累计消息条数 ÷ `lm_compress_count`**,与聊天快慢无关。每次整理会调用模型**两次**(整理事实 + 重写心事),但都只发"新片段 + 现有记忆库",不重发全部历史。想更省可调大 `lm_l0_max`、调小 `lm_l1_max_facts`,或把 `lm_thinking` 设为 `false`(但会漏记重要信息)。
+A: 只有私聊、且对话累积到 `long_memory.l0_max`(默认 260 条)时才整理一次,**整理次数 ≈ 累计消息条数 ÷ `long_memory.compress_count`**,与聊天快慢无关。每次整理会调用模型**两次**(整理事实 + 重写心事),但都只发"新片段 + 现有记忆库",不重发全部历史。想更省可调大 `long_memory.l0_max`、调小 `long_memory.l1_max_facts`,或把 `long_memory.thinking` 设为 `false`(但会漏记重要信息)。
 
 **Q: 说了"清空记忆"以后,机器人还会记得以前的事吗?**
 
@@ -484,7 +503,7 @@ A: 不会。私聊的"清空记忆"会**同时**删除对话窗口(`memory.json`
 
 **Q: 开了思考模式后,调 `temperature` 好像没反应?**
 
-A: 这是官方行为:**思考模式下 `temperature`、`presence_penalty`、`frequency_penalty` 都不生效**。想真正用这些采样参数,把 `enable_thinking` 设为 `false`。
+A: 这是官方行为:**思考模式下 `temperature`、`presence_penalty`、`frequency_penalty` 都不生效**。想真正用这些采样参数,把 `model.thinking` 设为 `false`。
 
 ## 🔒 隐私与安全
 
@@ -503,9 +522,9 @@ qq-deepseek-bot/
 ├── config.json               # 实际配置(本地,已被 gitignore)
 ├── .env.example              # 密钥示例(复制为 .env)
 ├── .env                      # 实际密钥(本地,已被 gitignore)
-├── persona.example.txt       # 主人格示例(复制为 persona.txt)
-├── persona.txt               # 主人格:对私聊/群聊白名单生效(本地,已被 gitignore)
-├── me.txt                    # 私密人格:只对 private_persona_whitelist 生效(本地,已被 gitignore)
+├── persona.example.txt       # 表人格示例(复制为 persona.txt)
+├── persona.txt               # 表人格:对私聊/群聊白名单生效(本地,已被 gitignore)
+├── me.txt                    # 里人格:只对 persona.inner_accounts 生效(本地,已被 gitignore)
 ├── memory.json               # 对话窗口记忆(自动生成,已被 gitignore)
 ├── memory_long.json          # 长期记忆 L1:事实 + 心事 + 流水(自动生成,已被 gitignore)
 ├── napcat-autologin.bat      # 快速登录脚本(本机专属,已被 gitignore)

@@ -31,104 +31,137 @@ VISION_API_KEY = os.getenv("VISION_API_KEY", "")
 if not TEXT_API_KEY or not VISION_API_KEY:
     raise SystemExit("缺少 API Key！请在 .env 中配置")
 
-# ---- 普通配置：从 config.json 读取 ----
+# ---- 配置：从 config.json 读取（按功能分组）----
 with open("config.json", "r", encoding="utf-8") as _f:
     CFG = json.load(_f)
 
-WS_URL = CFG["ws_url"]
-TEXT_BASE_URL = CFG["text_base_url"]
-TEXT_MODEL = CFG["text_model"]
-VISION_BASE_URL = CFG["vision_base_url"]
-VISION_MODEL = CFG["vision_model"]
-MAX_IMAGES_PER_MESSAGE = CFG["max_images_per_message"]
 
-# 固定回复语:可在 config.json 中自定义(省略时使用默认值,兼容旧配置文件)
-FALLBACK_REPLY = CFG.get("fallback_reply", "喵……刚才网络开小差了，再说一次好不好？")
-CLEAR_MEMORY_REPLY = CFG.get("clear_memory_reply", "喵~ 记忆已经清空啦，我们重新开始吧！")
+def _group(name: str) -> dict:
+    """取一个配置分组；缺失或类型不对时返回空字典，由组内各项自己的默认值兜底。
 
-BOT_QQ = CFG["bot_qq"]
-PRIVATE_WHITELIST = set(CFG["private_whitelist"])
-GROUP_WHITELIST = set(CFG["group_whitelist"])
+    分组的实际好处就在这里：整组一次性套默认值之后，config.json 里只需要写
+    你想改的项，不必把几十个键全抄一遍。
+    """
+    section = CFG.get(name)
+    return section if isinstance(section, dict) else {}
 
-GROUP_AT_ONLY = CFG["group_at_only"]
-GROUP_REPLY_PROBABILITY = CFG["group_reply_probability"]
-GROUP_KEYWORD_PROBABILITY = CFG["group_keyword_probability"]
-GROUP_ACTIVE_PROBABILITY = CFG["group_active_probability"]
-GROUP_DEFAULT_PROBABILITY = CFG["group_default_probability"]
-GROUP_ACTIVE_WINDOW = CFG["group_active_window"]
-GROUP_MAX_CONSECUTIVE_REPLIES = CFG["group_max_consecutive_replies"]
-KEYWORDS = CFG["keywords"]
 
-REPLY_PROBABILITY = CFG["reply_probability"]
-PROACTIVE_INTERVAL_PRIVATE = tuple(CFG["proactive_interval_private"])
-PROACTIVE_INTERVAL_GROUP = tuple(CFG["proactive_interval_group"])
-PROACTIVE_TO_EACH = CFG["proactive_to_each"]
+# ---- bot：身份与通用回复行为 ----
+_BOT = _group("bot")
+BOT_QQ = _BOT["qq"]
+ROBOT_NAME = _BOT.get("name", "小深")
+REPLY_PROBABILITY = _BOT.get("reply_probability", 0.7)
+FALLBACK_REPLY = _BOT.get("fallback_reply", "喵……刚才网络开小差了，再说一次好不好？")
+CLEAR_MEMORY_REPLY = _BOT.get("clear_memory_reply", "喵~ 记忆已经清空啦，我们重新开始吧！")
+
+# ---- model：文本与视觉模型 ----
+_MODEL = _group("model")
+TEXT_BASE_URL = _MODEL["text_base_url"]
+TEXT_MODEL = _MODEL["text_model"]
+VISION_BASE_URL = _MODEL["vision_base_url"]
+VISION_MODEL = _MODEL["vision_model"]
+MAX_IMAGES_PER_MESSAGE = _MODEL.get("max_images_per_message", 3)
+# 思考模式开关：deepseek-flash 默认开启思考模式。开启时回复更周到自然，代价是每轮多花约 70~120 个推理 token。
+# 注意：官方文档明确思考模式不支持 temperature / presence_penalty / frequency_penalty（传了不报错但不生效），
+# 所以下面 chat_with_deepseek 里的 temperature=1.3 只在 thinking=false 时才真正起作用。
+ENABLE_THINKING = _MODEL.get("thinking", True)
+
+# ---- whitelist：准入名单 ----
+# private 里的账号用**表人格**；用**里人格**的账号在 persona.inner_accounts，
+# 两者互不重叠（重叠时按里人格处理并告警）。
+_WHITELIST = _group("whitelist")
+PRIVATE_WHITELIST = set(_WHITELIST.get("private", []))
+GROUP_WHITELIST = set(_WHITELIST.get("group", []))
+
+# ---- group_chat：群聊行为 ----
+_GROUP = _group("group_chat")
+GROUP_AT_ONLY = _GROUP.get("at_only", True)
+GROUP_REPLY_PROBABILITY = _GROUP.get("reply_probability", 0.8)
+GROUP_KEYWORD_PROBABILITY = _GROUP.get("keyword_probability", 0.7)
+GROUP_ACTIVE_PROBABILITY = _GROUP.get("active_probability", 0.6)
+GROUP_DEFAULT_PROBABILITY = _GROUP.get("default_probability", 0.1)
+GROUP_ACTIVE_WINDOW = _GROUP.get("active_window", 600)
+GROUP_MAX_CONSECUTIVE_REPLIES = _GROUP.get("max_consecutive_replies", 5)
+KEYWORDS = _GROUP.get("keywords", [])
+
+# ---- proactive：主动消息 ----
+_PROACTIVE = _group("proactive")
+PROACTIVE_INTERVAL_PRIVATE = tuple(_PROACTIVE.get("interval_private", [1800, 7200]))
+PROACTIVE_INTERVAL_GROUP = tuple(_PROACTIVE.get("interval_group", [10800, 21600]))
+PROACTIVE_TO_EACH = _PROACTIVE.get("to_each", 0.5)
 # 主动消息的"静默期"（秒）：若距离上次对话不足这么久，就跳过本次主动消息，
 # 避免"刚聊完天，机器人又冒一句"的出戏情况。私聊/群聊分开配置，且按会话独立判断。
 # 设为 0 即关闭该机制。
-PROACTIVE_QUIET_PRIVATE = CFG.get("proactive_quiet_private", 60)
-PROACTIVE_QUIET_GROUP = CFG.get("proactive_quiet_group", 300)
+PROACTIVE_QUIET_PRIVATE = _PROACTIVE.get("quiet_private", 60)
+PROACTIVE_QUIET_GROUP = _PROACTIVE.get("quiet_group", 300)
 
-# ---- NapCat 掉线自愈 ----
+# ---- backend：后端进程与掉线自愈 ----
 # 账号被踢下线 / QQ 进程死掉时，自动执行"结束 QQ 进程 → 快速登录"把机器人拉回线上。
-AUTO_RELOGIN = CFG.get("auto_relogin", True)
-QQ_CLIENT_PATH = CFG.get("qq_client_path", r"D:\Tencent\QQNT\QQ.exe")
-AUTOLOGIN_SCRIPT = CFG.get("autologin_script", "napcat-autologin.bat")
-HEALTH_CHECK_INTERVAL = CFG.get("health_check_interval", 30)     # 看门狗巡检间隔（秒）
-RELOGIN_WAIT_SECONDS = CFG.get("relogin_wait_seconds", 180)      # 触发后等待上线的最长时间
-RELOGIN_MAX_PER_HOUR = CFG.get("relogin_max_per_hour", 2)        # 每小时最多自动重登次数
+_BACKEND = _group("backend")
+AUTO_RELOGIN = _BACKEND.get("auto_relogin", True)
+QQ_CLIENT_PATH = _BACKEND.get("qq_client_path", r"D:\Tencent\QQNT\QQ.exe")
+AUTOLOGIN_SCRIPT = _BACKEND.get("autologin_script", "napcat-autologin.bat")
+HEALTH_CHECK_INTERVAL = _BACKEND.get("health_check_interval", 30)   # 看门狗巡检间隔（秒）
+RELOGIN_WAIT_SECONDS = _BACKEND.get("relogin_wait_seconds", 180)    # 触发后等待上线的最长时间
+RELOGIN_MAX_PER_HOUR = _BACKEND.get("relogin_max_per_hour", 2)      # 每小时最多自动重登次数
 # 快速登录失败、需要扫码时的二维码来源（NapCat 会生成图片与含解码 URL 的控制台日志）
-QRCODE_IMAGE = CFG.get("qrcode_image", r"D:\tools\NapCat\cache\qrcode.png")
-QRCONSOLE_LOG = CFG.get("qrconsole_log") or os.path.join(
+QRCODE_IMAGE = _BACKEND.get("qrcode_image", r"D:\tools\NapCat\cache\qrcode.png")
+QRCONSOLE_LOG = _BACKEND.get("qrconsole_log") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "napcat-autologin.log")
 # 触发快速登录后,等待"上线 或 出现新二维码"的窗口(秒)。
 # 快速登录失败时 NapCat 会立刻生成新二维码(实测 0 秒级),无需苦等 90~180 秒。
-QR_DETECT_TIMEOUT = CFG.get("qr_detect_timeout", 20)
+QR_DETECT_TIMEOUT = _BACKEND.get("qr_detect_timeout", 20)
 # 扫码选择的最长等待时间(秒)。超时后会先复查一次在线状态:
 #   已上线(可能刚扫完码) → 视作"选 N"继续运行
 #   仍离线(无人值守)     → 按默认 Y 处理:清理 QQ/NapCat 进程并安全退出,
 #                          避免主循环卡死、进程一直占着登录会话
 # 设为 0 表示永远等待(纯人工值守时可用)。
-SCAN_PROMPT_TIMEOUT = CFG.get("scan_prompt_timeout", 300)
+SCAN_PROMPT_TIMEOUT = _BACKEND.get("scan_prompt_timeout", 300)
 # 停止 bot.py 时是否一并结束 QQ / NapCat 进程。
 # 默认 true：否则 Ctrl+C 之后 NapCat 与 QQ 会继续在后台占着内存和登录状态。
-KILL_QQ_ON_EXIT = CFG.get("kill_qq_on_exit", True)
+KILL_QQ_ON_EXIT = _BACKEND.get("kill_qq_on_exit", True)
 
-MEMORY_FILE = CFG["memory_file"]
+# ---- memory：L0 对话窗口与多段回复 ----
+_MEMORY = _group("memory")
+MEMORY_FILE = _MEMORY.get("file", "memory.json")
 
-# 思考模式开关：deepseek-flash 默认开启思考模式。开启时回复更周到自然，代价是每轮多花约 70~120 个推理 token。
-# 注意：官方文档明确思考模式不支持 temperature / presence_penalty / frequency_penalty（传了不报错但不生效），
-# 所以下面 chat_with_deepseek 里的 temperature=1.3 只在 enable_thinking=false 时才真正起作用。
-ENABLE_THINKING = CFG.get("enable_thinking", True)
+# 多段回复（模型用换行分隔时，按段依次发送多条消息）。
+# 模型用换行表示"再发一条"，一次回复变成先后几条短消息，更接近真人在 QQ 上连发几句。
+_SPLIT = _MEMORY.get("split_reply") or {}
+SPLIT_REPLY_ENABLED = _SPLIT.get("enabled", True)
+SPLIT_REPLY_MAX = _SPLIT.get("max", 10)                           # 最多拆成几条，超出合并到最后一条
+SPLIT_REPLY_INTERVAL = tuple(_SPLIT.get("interval", [0.5, 1.5]))   # 每条之间的随机间隔(秒)
 
-# ---- 长期记忆（仅私聊启用）----
+# ---- long_memory：L1 长期记忆（仅私聊启用）----
 # L0 = memories[key] 滑动窗口；L1 = memory_long.json 中按"事实条目"自更新的记忆库。
-# 当 L0 达到 LM_L0_MAX 条时，取最早的 LM_COMPRESS_COUNT 条与新片段交给模型，重写出一份精简的 L1。
-LONG_MEMORY_ENABLED = CFG.get("long_memory_enabled", False)
-LM_FILE = CFG.get("lm_file", "memory_long.json")
-LM_L0_MAX = CFG.get("lm_l0_max", 160)
-LM_COMPRESS_COUNT = CFG.get("lm_compress_count", 80)
-LM_COMPRESS_DELAY = CFG.get("lm_compress_delay", 3)
+# L0 超过 LM_L0_MAX 条时：私聊取最早的 LM_COMPRESS_COUNT 条交给模型重写 L1；
+# 群聊不建 L1，同样条数直接丢弃（两边的窗口参数是同一套）。
+_LM = _group("long_memory")
+LONG_MEMORY_ENABLED = _LM.get("enabled", False)
+LM_FILE = _LM.get("file", "memory_long.json")
+LM_L0_MAX = _LM.get("l0_max", 260)
+LM_COMPRESS_COUNT = _LM.get("compress_count", 120)
+LM_COMPRESS_DELAY = _LM.get("compress_delay", 3)
 # L1 的容量以「条目数」计，不以「字数」计。
 # 为什么改：模型是逐条生成的，"我写了几条"它数得清，"我写了多少字"只能靠猜。
 # 一条事实的 JSON 骨架固定占约 88 字符（t/seen/exp/n/sensitive 这些键名和默认值），
 # 按整段估算会把可用额度算少 7~9 倍（1000 字口径下：按 c 字段算是 50~66 条，按整段 JSON 算只有 7~10 条）。
 # 代码侧的统计口径从来只算 c 字段，和模型的直觉本就不一致——改用条目数后这个歧义从根上消失。
-LM_L1_MAX_FACTS = CFG.get("lm_l1_max_facts", 100)
+LM_L1_MAX_FACTS = _LM.get("l1_max_facts", 100)
 # 分类参考上限。作用是"防止某一类把总配额吃光"，不是给每类设死数字：
 # 整库没超 LM_L1_MAX_FACTS 时不触发任何淘汰。
 # 三个桶按内容量的天然比例分配：who 是身份与偏好（条目不多但都很硬）、
 # us 是关系状态（随相处持续累积，给得最宽）、event 是会自然翻篇的事（不需要留太多）。
-LM_L1_TYPE_QUOTA = CFG.get("lm_l1_type_quota", {
+LM_L1_TYPE_QUOTA = _LM.get("l1_type_quota", {
     "who": 20, "us": 24, "event": 16,
 })
 # 注入侧不再限制字数（条目数上限已经隐含了成本上限：100 条约 2400 字符，
 # 相比 L0 的几百条原始对话只是零头）。
 # 这个"保险丝"只在模型异常输出（例如一次返回好几百条）时兜底，正常永远碰不到。
-LM_L1_INJECT_HARD_LIMIT = CFG.get("lm_l1_inject_hard_limit", 200)
+LM_L1_INJECT_HARD_LIMIT = _LM.get("l1_inject_hard_limit", 200)
 # 私聊 L0 的兜底硬上限。正常压缩会在 LM_L0_MAX 就收口，这个上限只在"压缩持续失败"
 # 时生效，避免上下文无限膨胀；取 3 倍阈值是为了给压缩重试留足空间。
-LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
+LM_L0_HARD_LIMIT = _LM.get("l0_hard_limit", LM_L0_MAX * 3)
 
 # ---- 近期流水（recent）----
 # 为什么需要这一层：L0 在高密度对话下只覆盖几小时（实测约 100 条/小时，500 条也就 5 小时），
@@ -137,51 +170,49 @@ LM_L0_HARD_LIMIT = CFG.get("lm_l0_hard_limit", LM_L0_MAX * 3)
 # 它与 facts 有两点根本不同：
 #   1. 增量追加：模型只输出"本次新发现的事"，从不重写整份列表 —— 结构上不可能被覆盖；
 #   2. 时效由代码管（按"记录日"淘汰 + 条数保护），不依赖模型记得删。
-LM_RECENT_DAYS = CFG.get("lm_recent_days", 3)                # 保留最近几个聊过的日子
-LM_RECENT_MAX_ITEMS = CFG.get("lm_recent_max_items", 200)    # 条数保护上限
+LM_RECENT_DAYS = _LM.get("recent_days", 3)                   # 保留最近几个聊过的日子
+LM_RECENT_MAX_ITEMS = _LM.get("recent_max_items", 200)       # 条数保护上限
 # persona（"你心里的事"）的长度上限。它是每轮都注入的固定成本，
 # 同时也要防止模型把它写成流水账——心事本该是凝练的。
-LM_PERSONA_MAX_CHARS = CFG.get("lm_persona_max_chars", 400)
+LM_PERSONA_MAX_CHARS = _LM.get("persona_max_chars", 400)
 
-# ---- 多段回复（模型用换行分隔时，按段依次发送多条消息）----
-# 模型用换行表示"再发一条"，一次回复变成先后几条短消息，更接近真人在 QQ 上连发几句。
-SPLIT_REPLY_ENABLED = CFG.get("split_reply_enabled", True)
-SPLIT_REPLY_MAX = CFG.get("split_reply_max", 10)                    # 最多拆成几条，超出合并到最后一条
-SPLIT_REPLY_INTERVAL = tuple(CFG.get("split_reply_interval", [0.5, 1.5]))   # 每条之间的随机间隔(秒)
-
-# 记忆整理（压缩）是否开启思考模式。默认跟随全局 enable_thinking。
+# 记忆整理（压缩）是否开启思考模式。默认跟随全局 thinking。
 # 实测：开启思考后判断力明显更好——能正确区分"已撤销/已放弃"与"仍有效"的事件，
 # 不会漏掉生日、家人健康这类重要信息（关闭思考时会漏），条目也更精炼。
 # 代价是每次整理多约 1500 个推理 token（按当前价格约多 0.6 分钱/次）。
-LM_THINKING = CFG.get("lm_thinking", ENABLE_THINKING)
+LM_THINKING = _LM.get("thinking", ENABLE_THINKING)
 # 整理调用的输出上限。开启思考时需留足预算：推理 token 也计入 max_tokens，
 # 设得太小会导致推理吃光额度、返回空内容（实测 8000 时必然失败）。
-LM_REASONING_MAX_TOKENS = CFG.get("lm_max_tokens", 16000)
+LM_REASONING_MAX_TOKENS = _LM.get("max_tokens", 16000)
 
 # 配置自洽性校验：宁可不启动，也不要静默丢记忆
 if LONG_MEMORY_ENABLED and not (2 <= LM_COMPRESS_COUNT <= LM_L0_MAX // 2):
     raise SystemExit(
-        f"配置错误：lm_compress_count({LM_COMPRESS_COUNT}) 必须满足 2 <= 值 <= lm_l0_max/2({LM_L0_MAX // 2})，"
-        "否则压缩来不及在窗口溢出前生效"
+        f"配置错误：long_memory.compress_count({LM_COMPRESS_COUNT}) 必须满足 "
+        f"2 <= 值 <= long_memory.l0_max/2({LM_L0_MAX // 2})，否则压缩来不及在窗口溢出前生效"
     )
 if LONG_MEMORY_ENABLED and not (1 <= LM_RECENT_DAYS <= 30):
-    raise SystemExit(f"配置错误：lm_recent_days({LM_RECENT_DAYS}) 必须为 1~30 之间的整数")
+    raise SystemExit(
+        f"配置错误：long_memory.recent_days({LM_RECENT_DAYS}) 必须为 1~30 之间的整数")
 if LONG_MEMORY_ENABLED and LM_RECENT_MAX_ITEMS < 20:
-    raise SystemExit(f"配置错误：lm_recent_max_items({LM_RECENT_MAX_ITEMS}) 至少为 20")
+    raise SystemExit(
+        f"配置错误：long_memory.recent_max_items({LM_RECENT_MAX_ITEMS}) 至少为 20")
 if LONG_MEMORY_ENABLED and LM_PERSONA_MAX_CHARS < 100:
     raise SystemExit(
-        f"配置错误：lm_persona_max_chars({LM_PERSONA_MAX_CHARS}) 至少为 100")
+        f"配置错误：long_memory.persona_max_chars({LM_PERSONA_MAX_CHARS}) 至少为 100")
 if LONG_MEMORY_ENABLED and LM_COMPRESS_COUNT % 2 != 0:
     raise SystemExit(
-        f"配置错误：lm_compress_count({LM_COMPRESS_COUNT}) 必须是偶数，以保证裁剪落在对话边界上"
+        f"配置错误：long_memory.compress_count({LM_COMPRESS_COUNT}) 必须是偶数，"
+        "以保证裁剪落在对话边界上"
     )
 
-ENABLE_SILENT_HOURS = CFG["enable_silent_hours"]
-SILENT_HOURS_START = CFG["silent_hours_start"]
-SILENT_HOURS_END = CFG["silent_hours_end"]
-
-# 角色名
-ROBOT_NAME = CFG.get("bot_name", "小深")
+# ---- runtime：连接、静默时段与日志 ----
+_RUNTIME = _group("runtime")
+WS_URL = _RUNTIME.get("ws_url", "ws://127.0.0.1:3001")
+_SILENT = _RUNTIME.get("silent_hours") or {}
+ENABLE_SILENT_HOURS = _SILENT.get("enabled", False)
+SILENT_HOURS_START = _SILENT.get("start", 0)
+SILENT_HOURS_END = _SILENT.get("end", 10)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("DeepSeekBot")
@@ -197,46 +228,48 @@ def _load_persona_file(path: str, label: str) -> str:
         return ""
 
 
-# ---- 人格：主人格 + 私密人格 ----
-# 主人格对私聊白名单与群聊白名单生效（走现有全部机制）；
-# 私密人格只对 private_persona_whitelist 里的账号生效，仅限私聊（没有私密群聊）。
-# 私密账号与普通私聊账号待遇一致：L1 压缩、recent 滚动、心事生成、主动消息，一个不少，
-# 区别只在注入的 PERSONA 不同。私密人格不可用时一律回落主人格。
-if "persona_file" in CFG:
-    PERSONA = _load_persona_file(CFG["persona_file"], "主人格")
-    if not PERSONA.strip():
-        # 没有人格文件时机器人会以"没有设定"的状态说话，静默降级比启动失败更难排查
-        log.error(f"主人格为空或不可读：{CFG['persona_file']}，程序退出")
-        sys.exit(1)
-else:
-    PERSONA = CFG["persona"].replace("{bot_name}", ROBOT_NAME)
+# ---- 人格：表人格 + 里人格 ----
+# 表人格对 whitelist.private 与 whitelist.group 生效（走现有全部机制）；
+# 里人格只对 persona.inner_accounts 里的账号生效，仅限私聊（没有里人格群聊）。
+# 里人格账号与普通私聊账号待遇完全一致：L1 压缩、recent 滚动、心事生成、主动消息，
+# 一个不少，区别只在注入的人格不同。里人格不可用时一律回落表人格。
+_PERSONA_CFG = _group("persona")
+_outer = (_PERSONA_CFG.get("outer_file") or "").strip()
+if not _outer:
+    log.error("配置缺少 persona.outer_file（表人格），程序退出")
+    sys.exit(1)
+PERSONA_OUTER = _load_persona_file(_outer, "表人格")
+if not PERSONA_OUTER.strip():
+    # 没有人格文件时机器人会以"没有设定"的状态说话，静默降级比启动失败更难排查
+    log.error(f"表人格为空或不可读：{_outer}，程序退出")
+    sys.exit(1)
 
-PRIVATE_PERSONA_WHITELIST = set(CFG.get("private_persona_whitelist", []))
-PRIVATE_PERSONA = ""
-_ppf = (CFG.get("private_persona_file") or "").strip()
-if _ppf:
-    PRIVATE_PERSONA = _load_persona_file(_ppf, "私密人格")
-    if not PRIVATE_PERSONA.strip():
-        PRIVATE_PERSONA = ""
-        log.warning(f"私密人格不可用（{_ppf}），以下账号将回落主人格："
-                    f"{sorted(PRIVATE_PERSONA_WHITELIST)}")
-elif PRIVATE_PERSONA_WHITELIST:
-    log.warning("配置了 private_persona_whitelist 但未配置 private_persona_file，"
-                "这些账号将使用主人格")
+PERSONA_INNER_ACCOUNTS = set(_PERSONA_CFG.get("inner_accounts", []))
+PERSONA_INNER = ""
+_inner = (_PERSONA_CFG.get("inner_file") or "").strip()
+if _inner:
+    PERSONA_INNER = _load_persona_file(_inner, "里人格")
+    if not PERSONA_INNER.strip():
+        PERSONA_INNER = ""
+        log.warning(f"里人格不可用（{_inner}），以下账号将回落表人格："
+                    f"{sorted(PERSONA_INNER_ACCOUNTS)}")
+elif PERSONA_INNER_ACCOUNTS:
+    log.warning("配置了 persona.inner_accounts 但未配置 persona.inner_file，"
+                "这些账号将使用表人格")
 
-_overlap = PRIVATE_PERSONA_WHITELIST & PRIVATE_WHITELIST
+_overlap = PERSONA_INNER_ACCOUNTS & PRIVATE_WHITELIST
 if _overlap:
-    log.warning(f"以下账号同时在私聊白名单与私密私聊白名单中，按私密人格处理："
-                f"{sorted(_overlap)}")
+    log.warning(f"以下账号同时出现在 whitelist.private 与 persona.inner_accounts 中，"
+                f"按里人格处理：{sorted(_overlap)}")
 
 # 错误日志落盘。控制台日志一关窗就没了——上次排查"记忆被清空"时最大的障碍就是
 # log.warning / log.error 全都没留下，只能靠时间戳和文件内容反推。
 # 这里把 WARNING 及以上另存一份文件：只记异常与告警，不记常规流水
 # （INFO 量太大，会把文件刷满反而淹没真正的问题）。
-if CFG.get("log_file_enabled", True):
+if _RUNTIME.get("log_file_enabled", True):
     try:
         _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 CFG.get("log_file", "bot_error.log"))
+                                 _RUNTIME.get("log_file", "bot_error.log"))
         _fh = RotatingFileHandler(_log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
         _fh.setLevel(logging.WARNING)
         _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
@@ -737,12 +770,12 @@ def persona_for(key: str) -> str:
     """按会话 key 选人格：私密账号用私密人格，其余（含全部群聊）用主人格。
 
     群聊 key 形如 "g:123"，私聊 key 就是纯 uid 字符串；私密人格只对私聊生效，
-    所以这里用 isdigit 把群聊排除在外。"私密人格未配置"时 PRIVATE_PERSONA 是空串，
-    自然回落到主人格。
+    所以这里用 isdigit 把群聊排除在外。"里人格未配置"时 PERSONA_INNER 是空串，
+    自然回落到表人格。
     """
-    if PRIVATE_PERSONA and key.isdigit() and int(key) in PRIVATE_PERSONA_WHITELIST:
-        return PRIVATE_PERSONA
-    return PERSONA
+    if PERSONA_INNER and key.isdigit() and int(key) in PERSONA_INNER_ACCOUNTS:
+        return PERSONA_INNER
+    return PERSONA_OUTER
 
 
 def build_system_content(key: str) -> str:
@@ -1253,7 +1286,7 @@ async def update_persona(key: str, old_persona: str, facts: list, recent: dict,
     - 最近流水（recent）：这几天生活的质感；
     - 对话原文尾部（dialog_tail）：语气、停顿、那些没说完的半句——这是 facts 必然会
       丢掉的，而心事恰恰长在这些缝隙里。
-    再加上原人格（PERSONA）作为进入角色的钥匙，与旧版 persona 保证延续性。
+    再加上原人格（表/里人格）作为进入角色的钥匙，保证延续性。
 
     注意：注入 facts 不等于"把她拉回总结模式"——**任务描述才决定她做什么**，
     素材只决定她"知道什么"。任务是"写下你因此变成了什么样"。
@@ -2266,8 +2299,8 @@ async def handle_message(ws, data: dict):
         return
 
     if mtype == "private":
-        # 私密私聊白名单与私聊白名单互不重叠，准入判定取两者的并集
-        if uid not in PRIVATE_WHITELIST and uid not in PRIVATE_PERSONA_WHITELIST:
+        # 里人格账号与私聊白名单互不重叠，准入判定取两者的并集
+        if uid not in PRIVATE_WHITELIST and uid not in PERSONA_INNER_ACCOUNTS:
             return
         key = str(uid)
 
@@ -2375,7 +2408,7 @@ async def proactive_loop_private(ws):
                 log.info(f"当前北京时间 {now_hour} 点，处于静音时段，跳过主动私聊")
                 continue
 
-        for uid in PRIVATE_WHITELIST | PRIVATE_PERSONA_WHITELIST:
+        for uid in PRIVATE_WHITELIST | PERSONA_INNER_ACCOUNTS:
             if random.random() > PROACTIVE_TO_EACH:
                 continue
             key = str(uid)
@@ -2510,9 +2543,9 @@ async def main():
                  f"心事（persona）上限 {LM_PERSONA_MAX_CHARS} 字；存储于 {LM_FILE}")
         log.info(f"群聊 L0 与私聊共用同一窗口参数（上限 {LM_L0_MAX} 条 / 每次 {LM_COMPRESS_COUNT} 条），"
                  f"但群聊只截断丢弃，不压缩、不写入 L1")
-    log.info(f"人格：主人格 {CFG.get('persona_file') or '（config.persona 内嵌）'}"
-             + (f"；私密人格 {_ppf}，适用 {sorted(PRIVATE_PERSONA_WHITELIST)}"
-                if PRIVATE_PERSONA else "；私密人格未启用，全部账号使用主人格"))
+    log.info(f"人格：表人格 {_outer}"
+             + (f"；里人格 {_inner}，适用 {sorted(PERSONA_INNER_ACCOUNTS)}"
+                if PERSONA_INNER else "；里人格未启用，全部账号使用表人格"))
     log.info(f"正在连接 NapCat: {WS_URL}")
     if AUTO_RELOGIN:
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"

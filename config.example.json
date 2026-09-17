@@ -1,76 +1,95 @@
 {
-  "bot_name": "小深",
-  "persona_file": "persona.txt",
-  "private_persona_file": "",
-  "private_persona_whitelist": [],
-
-  "ws_url": "ws://127.0.0.1:3001",
-  "text_base_url": "https://api.deepseek.com",
-  "text_model": "deepseek-flash",
-  "enable_thinking": true,
-  "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "vision_model": "qwen3.7-flash",
-  "max_images_per_message": 3,
-
-  "bot_qq": 1234567890,
-  "private_whitelist": [],
-  "group_whitelist": [],
-
-  "group_at_only": true,
-  "group_reply_probability": 0.8,
-  "group_keyword_probability": 0.7,
-  "group_active_probability": 0.6,
-  "group_default_probability": 0.1,
-  "group_active_window": 600,
-  "group_max_consecutive_replies": 5,
-  "keywords": ["小深", "猫娘"],
-
-  "reply_probability": 0.7,
-  "fallback_reply": "喵……刚才网络开小差了，再说一次好不好？",
-  "clear_memory_reply": "喵~ 记忆已经清空啦，我们重新开始吧！",
-  "proactive_interval_private": [1800, 7200],
-  "proactive_interval_group": [10800, 21600],
-  "proactive_to_each": 0.5,
-  "proactive_quiet_private": 60,
-  "proactive_quiet_group": 300,
-
-  "auto_relogin": true,
-  "qq_client_path": "D:\\Tencent\\QQNT\\QQ.exe",
-  "autologin_script": "napcat-autologin.bat",
-  "health_check_interval": 30,
-  "relogin_wait_seconds": 180,
-  "relogin_max_per_hour": 2,
-  "kill_qq_on_exit": true,
-  "qr_detect_timeout": 20,
-  "scan_prompt_timeout": 300,
-
-  "memory_file": "memory.json",
-  "enable_silent_hours": true,
-  "silent_hours_start": 0,
-  "silent_hours_end": 10,
-
-  "long_memory_enabled": true,
-  "lm_file": "memory_long.json",
-  "lm_l0_max": 260,
-  "lm_compress_count": 120,
-  "lm_compress_delay": 3,
-  "lm_l1_max_facts": 60,
-  "lm_l1_type_quota": {
-    "who": 20,
-    "us": 24,
-    "event": 16
+  "bot": {
+    "qq": 1234567890,
+    "name": "小深",
+    "reply_probability": 0.7,
+    "fallback_reply": "喵……刚才网络开小差了，再说一次好不好？",
+    "clear_memory_reply": "喵~ 记忆已经清空啦，我们重新开始吧！"
   },
-  "lm_recent_days": 3,
-  "lm_recent_max_items": 200,
-  "lm_persona_max_chars": 400,
-  "log_file_enabled": true,
-  "log_file": "bot_error.log",
-  "lm_l1_inject_hard_limit": 200,
-  "lm_l0_hard_limit": 780,
-  "lm_thinking": true,
-  "lm_max_tokens": 16000,
 
-  "split_reply_enabled": true,
-  "split_reply_max": 10,
-  "split_reply_interval": [0.5, 1.5]
+  "model": {
+    "text_base_url": "https://api.deepseek.com",
+    "text_model": "deepseek-flash",
+    "vision_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "vision_model": "qwen3.7-flash",
+    "max_images_per_message": 3,
+    "thinking": true
+  },
+
+  "persona": {
+    "outer_file": "persona.txt",
+    "inner_file": "",
+    "inner_accounts": []
+  },
+
+  "whitelist": {
+    "private": [],
+    "group": []
+  },
+
+  "group_chat": {
+    "at_only": true,
+    "reply_probability": 0.8,
+    "keyword_probability": 0.7,
+    "active_probability": 0.6,
+    "default_probability": 0.1,
+    "active_window": 600,
+    "max_consecutive_replies": 5,
+    "keywords": ["小深", "猫娘"]
+  },
+
+  "proactive": {
+    "interval_private": [1800, 7200],
+    "interval_group": [10800, 21600],
+    "to_each": 0.5,
+    "quiet_private": 60,
+    "quiet_group": 300
+  },
+
+  "memory": {
+    "file": "memory.json",
+    "split_reply": {
+      "enabled": true,
+      "max": 10,
+      "interval": [0.5, 1.5]
+    }
+  },
+
+  "long_memory": {
+    "enabled": true,
+    "file": "memory_long.json",
+    "l0_max": 260,
+    "compress_count": 120,
+    "compress_delay": 3,
+    "l0_hard_limit": 780,
+    "l1_max_facts": 60,
+    "l1_type_quota": { "who": 20, "us": 24, "event": 16 },
+    "l1_inject_hard_limit": 200,
+    "recent_days": 3,
+    "recent_max_items": 200,
+    "persona_max_chars": 400,
+    "thinking": true,
+    "max_tokens": 16000
+  },
+
+  "runtime": {
+    "ws_url": "ws://127.0.0.1:3001",
+    "silent_hours": { "enabled": true, "start": 0, "end": 10 },
+    "log_file_enabled": true,
+    "log_file": "bot_error.log"
+  },
+
+  "backend": {
+    "auto_relogin": true,
+    "qq_client_path": "D:\\Tencent\\QQNT\\QQ.exe",
+    "autologin_script": "napcat-autologin.bat",
+    "health_check_interval": 30,
+    "relogin_wait_seconds": 180,
+    "relogin_max_per_hour": 2,
+    "qrcode_image": "D:\\tools\\NapCat\\cache\\qrcode.png",
+    "qrconsole_log": "",
+    "qr_detect_timeout": 20,
+    "scan_prompt_timeout": 300,
+    "kill_qq_on_exit": true
+  }
 }
