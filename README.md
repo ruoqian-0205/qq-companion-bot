@@ -132,6 +132,8 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 | `outer_file` | — | **表人格**文件路径(**必填**,缺失则报错退出) |
 | `inner_file` | `""` | **里人格**文件路径;为空/读不到/内容为空 → 回落表人格并告警 |
 | `inner_accounts` | `[]` | 使用里人格的私聊账号(**不要**同时写进 `whitelist.private`) |
+| `inner_fallback_reply` | `""` | 里人格账号的兜底回复(模型调用失败时);留空则回退到 `bot.fallback_reply` |
+| `inner_clear_memory_reply` | `""` | 里人格账号的"清空记忆"回复;留空则回退到 `bot.clear_memory_reply` |
 
 ### `whitelist` — 准入名单
 

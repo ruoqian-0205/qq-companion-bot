@@ -51,8 +51,10 @@ _BOT = _group("bot")
 BOT_QQ = _BOT["qq"]
 ROBOT_NAME = _BOT.get("name", "小深")
 REPLY_PROBABILITY = _BOT.get("reply_probability", 0.7)
-FALLBACK_REPLY = _BOT.get("fallback_reply", "喵……刚才网络开小差了，再说一次好不好？")
-CLEAR_MEMORY_REPLY = _BOT.get("clear_memory_reply", "喵~ 记忆已经清空啦，我们重新开始吧！")
+# 固定回复分表/里两套：这两个是**表人格**的基准值，里人格那套在 persona 组里配，
+# 留空即沿用这里（未配置自动回退，不必把同样的句子抄两遍）。
+FALLBACK_REPLY_OUTER = _BOT.get("fallback_reply", "喵……刚才网络开小差了，再说一次好不好？")
+CLEAR_MEMORY_REPLY_OUTER = _BOT.get("clear_memory_reply", "喵~ 记忆已经清空啦，我们重新开始吧！")
 
 # ---- model：文本与视觉模型 ----
 _MODEL = _group("model")
@@ -261,6 +263,13 @@ _overlap = PERSONA_INNER_ACCOUNTS & PRIVATE_WHITELIST
 if _overlap:
     log.warning(f"以下账号同时出现在 whitelist.private 与 persona.inner_accounts 中，"
                 f"按里人格处理：{sorted(_overlap)}")
+
+# 里人格账号的固定回复（模型调用失败时的兜底、清空记忆的确认语）。
+# 留空就沿用表人格那一套 —— 未配置即自动回退。
+FALLBACK_REPLY_INNER = ((_PERSONA_CFG.get("inner_fallback_reply") or "").strip()
+                        or FALLBACK_REPLY_OUTER)
+CLEAR_MEMORY_REPLY_INNER = ((_PERSONA_CFG.get("inner_clear_memory_reply") or "").strip()
+                            or CLEAR_MEMORY_REPLY_OUTER)
 
 # 错误日志落盘。控制台日志一关窗就没了——上次排查"记忆被清空"时最大的障碍就是
 # log.warning / log.error 全都没留下，只能靠时间戳和文件内容反推。
@@ -766,6 +775,26 @@ def group_reply_probability(gid: int, mentioned: bool, text: str, nickname: str)
     return GROUP_ACTIVE_PROBABILITY
 
 # ---------- 生成系统提示（私聊/群聊区分） ----------
+def _is_inner_key(key: str) -> bool:
+    """该会话是否属于里人格账号。
+
+    群聊 key 形如 "g:123"，私聊 key 就是纯 uid 字符串，用 isdigit 即可把群聊排除。
+    这里刻意**不看** PERSONA_INNER 是否为空：人格文件缺失时该回落表人格，
+    但"这个账号属于里人格名单"这件事本身没变。
+    """
+    return key.isdigit() and int(key) in PERSONA_INNER_ACCOUNTS
+
+
+def fallback_reply_for(key: str) -> str:
+    """模型调用失败时的兜底回复，按人格取。"""
+    return FALLBACK_REPLY_INNER if _is_inner_key(key) else FALLBACK_REPLY_OUTER
+
+
+def clear_memory_reply_for(key: str) -> str:
+    """“清空记忆”的确认回复，按人格取。"""
+    return CLEAR_MEMORY_REPLY_INNER if _is_inner_key(key) else CLEAR_MEMORY_REPLY_OUTER
+
+
 def persona_for(key: str) -> str:
     """按会话 key 选人格：私密账号用私密人格，其余（含全部群聊）用主人格。
 
@@ -773,7 +802,7 @@ def persona_for(key: str) -> str:
     所以这里用 isdigit 把群聊排除在外。"里人格未配置"时 PERSONA_INNER 是空串，
     自然回落到表人格。
     """
-    if PERSONA_INNER and key.isdigit() and int(key) in PERSONA_INNER_ACCOUNTS:
+    if PERSONA_INNER and _is_inner_key(key):
         return PERSONA_INNER
     return PERSONA_OUTER
 
@@ -1604,7 +1633,7 @@ async def chat_with_deepseek(key: str, msgs: list[dict]) -> tuple[str, bool]:
         return reply, True
     except Exception as e:
         log.error(f"DeepSeek 调用失败: {e}")
-        return FALLBACK_REPLY, False
+        return fallback_reply_for(key), False
 
 
 def build_reply_msgs(key: str, user_text: str | None) -> list[dict]:
@@ -2308,7 +2337,7 @@ async def handle_message(ws, data: dict):
         async with get_mem_lock(key):
             if "清空记忆" in text:
                 clear_long_memory(key)   # 清 L0 + L1，并让在途压缩作废
-                if not await send_private_msg(ws, uid, CLEAR_MEMORY_REPLY):
+                if not await send_private_msg(ws, uid, clear_memory_reply_for(key)):
                     # 记忆确实已清空，只是回复没送出去；记日志以免用户以为没生效而反复发
                     log.warning(f"清空记忆已执行，但确认回复未送达 uid={uid}")
                 return
@@ -2353,7 +2382,7 @@ async def handle_message(ws, data: dict):
 
         if "清空记忆" in text:
             clear_long_memory(key)
-            if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY,
+            if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY_OUTER,
                                         at_qq=uid if mentioned else None):
                 log.warning(f"清空记忆已执行，但确认回复未送达 gid={gid}")
             return
@@ -2485,7 +2514,7 @@ async def debug_console():
             break
         if "清空记忆" in text:
             clear_long_memory("debug")
-            print(f"{ROBOT_NAME}: {CLEAR_MEMORY_REPLY}\n")
+            print(f"{ROBOT_NAME}: {CLEAR_MEMORY_REPLY_OUTER}\n")
             continue
         async with get_mem_lock("debug"):
             await append_memory("debug", "user", text)

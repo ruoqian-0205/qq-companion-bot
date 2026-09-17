@@ -19,7 +19,9 @@
   "persona": {
     "outer_file": "persona.txt",
     "inner_file": "",
-    "inner_accounts": []
+    "inner_accounts": [],
+    "inner_fallback_reply": "",
+    "inner_clear_memory_reply": ""
   },
 
   "whitelist": {
