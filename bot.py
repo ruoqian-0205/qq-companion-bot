@@ -266,10 +266,21 @@ if _overlap:
 
 # 里人格账号的固定回复（模型调用失败时的兜底、清空记忆的确认语）。
 # 留空就沿用表人格那一套 —— 未配置即自动回退。
-FALLBACK_REPLY_INNER = ((_PERSONA_CFG.get("inner_fallback_reply") or "").strip()
-                        or FALLBACK_REPLY_OUTER)
-CLEAR_MEMORY_REPLY_INNER = ((_PERSONA_CFG.get("inner_clear_memory_reply") or "").strip()
-                            or CLEAR_MEMORY_REPLY_OUTER)
+_inner_fallback = (_PERSONA_CFG.get("inner_fallback_reply") or "").strip()
+_inner_clear = (_PERSONA_CFG.get("inner_clear_memory_reply") or "").strip()
+FALLBACK_REPLY_INNER = _inner_fallback or FALLBACK_REPLY_OUTER
+CLEAR_MEMORY_REPLY_INNER = _inner_clear or CLEAR_MEMORY_REPLY_OUTER
+
+# 里人格确实在用、但固定回复留空时提醒一句。
+# 回退本身不影响运行，可这两句恰恰是"出戏"时唯一会露出来的话术 —— 里人格往往
+# 需要另一种语气，静默沿用表人格的话术很容易一直注意不到。
+if PERSONA_INNER and PERSONA_INNER_ACCOUNTS:
+    if not _inner_fallback:
+        log.warning(f"里人格已启用，但未配置 persona.inner_fallback_reply，"
+                    f"这些账号将沿用表人格的兜底回复：{FALLBACK_REPLY_OUTER!r}")
+    if not _inner_clear:
+        log.warning(f"里人格已启用，但未配置 persona.inner_clear_memory_reply，"
+                    f"这些账号将沿用表人格的“清空记忆”回复：{CLEAR_MEMORY_REPLY_OUTER!r}")
 
 # 错误日志落盘。控制台日志一关窗就没了——上次排查"记忆被清空"时最大的障碍就是
 # log.warning / log.error 全都没留下，只能靠时间戳和文件内容反推。
