@@ -21,7 +21,7 @@
 | **主动打招呼** | 空闲时随机发起开场白,私聊/群聊可分别配置;带**聊天避让**(最近在对话就不打扰) |
 | **掉线自愈** | 账号被踢下线或 QQ 进程退出时,**自动无黑窗快速登录**把机器人拉回线上 |
 | **消息送达保障** | 生成前检查在线状态(省 token);发送后等回执,**没送达就不写记忆** |
-| **人设系统** | `persona.txt` 独立维护角色设定,支持 `{bot_name}` 占位符 |
+| **人设系统** | 主人格 `persona.txt` + 私密人格 `me.txt` 双份独立维护,支持 `{bot_name}` 占位符;私密人格只对私密私聊白名单生效 |
 | **静音时段** | 可配置北京时间凌晨时段不主动打扰 |
 | **调试模式** | `python bot.py --debug` 在终端测试人设与回复,不连 QQ |
 
@@ -105,7 +105,9 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `bot_name` | `小深` | 机器人名字,替换人设中的 `{bot_name}` |
-| `persona_file` | `persona.txt` | 人设文件路径(也可用 `persona` 字段内联) |
+| `persona_file` | `persona.txt` | 主人格文件路径(也可用 `persona` 字段内联);缺失则报错退出 |
+| `private_persona_file` | `me.txt` | 私密人格文件路径;为空/读不到则回落主人格 |
+| `private_persona_whitelist` | `[]` | 私密私聊白名单(这些账号不要写进 `private_whitelist`) |
 | `ws_url` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
 | `bot_qq` | — | 机器人 QQ 号 |
 | `private_whitelist` | `[]` | 私聊白名单 |
@@ -154,12 +156,11 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 | 配置项 | 默认值                | 说明 |
 |---|--------------------|---|
-| `memory_max_messages` | `40`               | **群聊**保留的最大消息条数(私聊由长期记忆接管) |
 | `memory_file` | `memory.json`      | 对话记忆文件(自动生成,勿手动编辑) |
 | `long_memory_enabled` | `true`             | 是否启用私聊长期记忆 |
 | `lm_file` | `memory_long.json` | 长期记忆文件:事实 + 心事 + 流水(自动生成) |
-| `lm_l0_max` | `260`              | 私聊对话达到多少条时触发一次整理 |
-| `lm_compress_count` | `120`              | 每次整理掉最早多少条(须为偶数,且 ≤ `lm_l0_max` 的一半) |
+| `lm_l0_max` | `260`              | L0 超过多少条时处理一次(**私聊与群聊共用同一参数**) |
+| `lm_compress_count` | `120`              | 每次处理掉最早多少条(须为偶数,且 ≤ `lm_l0_max` 的一半);私聊压进 L1,群聊直接丢弃 |
 | `lm_compress_delay` | `3`                | 触发后延迟几秒再整理(合并连续消息,避开回复请求) |
 | `lm_l1_max_facts` | `60`               | 事实库整库**条目数**上限(须 ≥ 三个桶配额之和,否则拒绝启动) |
 | `lm_l1_type_quota` | `who 20 / us 24 / event 16` | 各桶参考上限,防止某一桶把总配额吃光 |
@@ -217,7 +218,7 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 | 层 | 存储位置 | 内容 | 更新方式 |
 |---|---|---|---|
-| **L0 对话窗口** | `memory.json` | 最近若干条原始对话(带时间戳) | 持续追加,压缩时裁掉最早一段 |
+| **L0 对话窗口** | `memory.json` | 最近若干条原始对话(带时间戳) | 持续追加;私聊与群聊共用 `lm_l0_max`,私聊压缩进 L1、群聊直接丢弃 |
 | **L1 事实库** | `memory_long.json` → `facts` | 三个桶的长期事实 | **整体重写**(带覆盖防护) |
 | **L1 心事** | `memory_long.json` → `persona` | 相处中长出的偏好、自我觉察、没说出口的欲望 | **整体重写**,独立角色内省调用 |
 | **近期流水** | `memory_long.json` → `recent` | 最近几天的日常 | **增量追加**,代码按记录日淘汰 |
@@ -226,11 +227,22 @@ python bot.py --debug    # 调试模式(不连 QQ,直接测人设与回复)
 
 ```
 聊天中 → 消息持续写入 L0
-      → L0 达到 lm_l0_max(默认 260 条)
-      → 延迟 lm_compress_delay 秒,把最早的 lm_compress_count 条 + 现有事实库交给模型整理
-      → 先写回事实库,再从 L0 删掉这些消息(最坏只是重复整理,不会丢消息)
-      → 紧接着用「压缩后的 facts + 合并后的流水 + 裁剪后剩余的 L0」再调一次模型,重写 persona
+      → L0 超过 lm_l0_max(默认 260 条)
+      ├─ 私聊
+      │    → 延迟 lm_compress_delay 秒,把最早的 lm_compress_count 条 + 现有事实库交给模型整理
+      │    → 先写回事实库,再从 L0 删掉这些消息(最坏只是重复整理,不会丢消息)
+      │    → 紧接着用「压缩后的 facts + 合并后的流水 + 裁剪后剩余的 L0」再调一次模型,重写 persona
+      └─ 群聊
+           → 直接丢弃最早的 lm_compress_count 条(不调模型、不写入 L1)
 ```
+
+> **为什么是"攒够一批再截断",而不是每条都滑窗?**
+> 逐条滑窗会让 L0 的开头每来一条新消息就往后移一位,于是每一轮请求的 prompt 前缀都不同,
+> DeepSeek 的上下文缓存永远命中不了,整段上下文每轮都按 cache miss 计费。
+> 批量截断把窗口起点在一段时间内钉住,两次截断之间的每一轮前缀逐字节一致,缓存才能命中 —— 这才是省 token 的关键。
+>
+> 群聊之所以只截断、不压缩:群里大多是水聊,记忆价值低,不值得为它长期维护一份 L1;
+> 但窗口长度与私聊保持一致,一次截断能覆盖大半天的流水。
 
 **三个事实桶 —— 按「回答什么问题」划分,而不是按主题:**
 
@@ -491,8 +503,9 @@ qq-deepseek-bot/
 ├── config.json               # 实际配置(本地,已被 gitignore)
 ├── .env.example              # 密钥示例(复制为 .env)
 ├── .env                      # 实际密钥(本地,已被 gitignore)
-├── persona.example.txt       # 人设示例(复制为 persona.txt)
-├── persona.txt / me.txt      # 实际人设(本地,已被 gitignore)
+├── persona.example.txt       # 主人格示例(复制为 persona.txt)
+├── persona.txt               # 主人格:对私聊/群聊白名单生效(本地,已被 gitignore)
+├── me.txt                    # 私密人格:只对 private_persona_whitelist 生效(本地,已被 gitignore)
 ├── memory.json               # 对话窗口记忆(自动生成,已被 gitignore)
 ├── memory_long.json          # 长期记忆 L1:事实 + 心事 + 流水(自动生成,已被 gitignore)
 ├── napcat-autologin.bat      # 快速登录脚本(本机专属,已被 gitignore)

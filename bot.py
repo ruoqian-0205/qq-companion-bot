@@ -94,7 +94,6 @@ SCAN_PROMPT_TIMEOUT = CFG.get("scan_prompt_timeout", 300)
 # 默认 true：否则 Ctrl+C 之后 NapCat 与 QQ 会继续在后台占着内存和登录状态。
 KILL_QQ_ON_EXIT = CFG.get("kill_qq_on_exit", True)
 
-MEMORY_MAX_MESSAGES = CFG["memory_max_messages"]
 MEMORY_FILE = CFG["memory_file"]
 
 # 思考模式开关：deepseek-flash 默认开启思考模式。开启时回复更周到自然，代价是每轮多花约 70~120 个推理 token。
@@ -184,18 +183,51 @@ SILENT_HOURS_END = CFG["silent_hours_end"]
 # 角色名
 ROBOT_NAME = CFG.get("bot_name", "小深")
 
-# 加载人设（从 config.json 或独立文件）
-if "persona_file" in CFG:
-    with open(CFG["persona_file"], "r", encoding="utf-8") as f:
-        PERSONA_TEMPLATE = f.read()
-else:
-    PERSONA_TEMPLATE = CFG["persona"]
-
-# 将人设中的占位符替换为实际角色名
-PERSONA = PERSONA_TEMPLATE.replace("{bot_name}", ROBOT_NAME)
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("DeepSeekBot")
+
+
+def _load_persona_file(path: str, label: str) -> str:
+    """读一个人设文件并替换角色名占位符；读不到返回空串，由调用方决定后果。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().replace("{bot_name}", ROBOT_NAME)
+    except OSError as e:
+        log.error(f"{label}文件读取失败：{path}（{e}）")
+        return ""
+
+
+# ---- 人格：主人格 + 私密人格 ----
+# 主人格对私聊白名单与群聊白名单生效（走现有全部机制）；
+# 私密人格只对 private_persona_whitelist 里的账号生效，仅限私聊（没有私密群聊）。
+# 私密账号与普通私聊账号待遇一致：L1 压缩、recent 滚动、心事生成、主动消息，一个不少，
+# 区别只在注入的 PERSONA 不同。私密人格不可用时一律回落主人格。
+if "persona_file" in CFG:
+    PERSONA = _load_persona_file(CFG["persona_file"], "主人格")
+    if not PERSONA.strip():
+        # 没有人格文件时机器人会以"没有设定"的状态说话，静默降级比启动失败更难排查
+        log.error(f"主人格为空或不可读：{CFG['persona_file']}，程序退出")
+        sys.exit(1)
+else:
+    PERSONA = CFG["persona"].replace("{bot_name}", ROBOT_NAME)
+
+PRIVATE_PERSONA_WHITELIST = set(CFG.get("private_persona_whitelist", []))
+PRIVATE_PERSONA = ""
+_ppf = (CFG.get("private_persona_file") or "").strip()
+if _ppf:
+    PRIVATE_PERSONA = _load_persona_file(_ppf, "私密人格")
+    if not PRIVATE_PERSONA.strip():
+        PRIVATE_PERSONA = ""
+        log.warning(f"私密人格不可用（{_ppf}），以下账号将回落主人格："
+                    f"{sorted(PRIVATE_PERSONA_WHITELIST)}")
+elif PRIVATE_PERSONA_WHITELIST:
+    log.warning("配置了 private_persona_whitelist 但未配置 private_persona_file，"
+                "这些账号将使用主人格")
+
+_overlap = PRIVATE_PERSONA_WHITELIST & PRIVATE_WHITELIST
+if _overlap:
+    log.warning(f"以下账号同时在私聊白名单与私密私聊白名单中，按私密人格处理："
+                f"{sorted(_overlap)}")
 
 # 错误日志落盘。控制台日志一关窗就没了——上次排查"记忆被清空"时最大的障碍就是
 # log.warning / log.error 全都没留下，只能靠时间戳和文件内容反推。
@@ -624,27 +656,44 @@ def clear_long_memory(key: str) -> None:
     if LONG_MEMORY_ENABLED:
         save_long_memory()
 
+def trim_l0(key: str, limit: int, batch: int) -> int:
+    """到上限就一次性丢弃最早的一批——不是逐条滑窗。返回丢弃条数。
+
+    为什么必须是"批量"而不是"逐条"：逐条滑窗会让 L0 的开头每来一条新消息就往
+    后移一位，于是每一轮请求的 prompt 前缀都不同，DeepSeek 的上下文缓存永远命中
+    不了，整段上下文每轮都按 cache miss 计费。批量截断把窗口起点在一段时间内钉住，
+    两次截断之间的每一轮前缀逐字节一致，缓存才能命中——这才是省 token 的关键。
+    """
+    msgs = memories.get(key)
+    if not msgs or len(msgs) <= limit:
+        return 0
+    del msgs[:batch]
+    return batch
+
+
 async def append_memory(key: str, role: str, content: str):
     """追加一条记忆（带时间前缀）。
 
     时间戳写入行为与改造前完全一致；区别只在于本函数改为 async，并要求调用方持有该 key 的锁，
     从而保证"追加 + 落盘"是原子的，避免同一用户连发消息时互相覆盖。
-    群聊沿用 memory_max_messages 硬截断；私聊正常交给长期记忆压缩接管窗口长度，
-    但保留一个远高于阈值的兜底上限——万一压缩持续失败（如 API 长期故障），
+    群聊与私聊共用同一套窗口参数（LM_L0_MAX / LM_COMPRESS_COUNT），只是超限后的
+    处理方式不同：私聊把这批交给长期记忆压缩进 L1，群聊直接丢弃（群聊不建 L1）。
+    私聊另有一个远高于阈值的兜底上限——万一压缩持续失败（如 API 长期故障），
     上下文不会无限膨胀导致每轮请求越来越慢、越来越贵。
-    关闭长期记忆时（LONG_MEMORY_ENABLED=False）私聊回退到 memory_max_messages 截断，
+    关闭长期记忆时（LONG_MEMORY_ENABLED=False）私聊只能退回截断，
     否则没有任何机制收口，上下文会无限增长。
     """
     time_str = get_beijing_time_str()
     content = f"[{time_str}] {content}"
     memories.setdefault(key, []).append({"role": role, "content": content})
     if key.startswith("g:"):
-        if len(memories[key]) > MEMORY_MAX_MESSAGES:
-            memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
+        # 群聊：截断即丢弃，不调模型、不写入 L1
+        dropped = trim_l0(key, LM_L0_MAX, LM_COMPRESS_COUNT)
+        if dropped:
+            log.info(f"群聊 {key} L0 达到 {LM_L0_MAX} 条，已丢弃最早 {dropped} 条")
     elif not LONG_MEMORY_ENABLED:
-        # 没有长期记忆接管，只能按普通窗口截断（与群聊一致）
-        if len(memories[key]) > MEMORY_MAX_MESSAGES:
-            memories[key] = memories[key][-MEMORY_MAX_MESSAGES:]
+        # 没有长期记忆接管，只能按同样的窗口参数截断（与群聊一致）
+        trim_l0(key, LM_L0_MAX, LM_COMPRESS_COUNT)
     elif len(memories[key]) > LM_L0_HARD_LIMIT:
         # 兜底：正常压缩会在 LM_L0_MAX 就收口，只有压缩持续失败才会走到这里
         keep = LM_L0_HARD_LIMIT
@@ -684,9 +733,21 @@ def group_reply_probability(gid: int, mentioned: bool, text: str, nickname: str)
     return GROUP_ACTIVE_PROBABILITY
 
 # ---------- 生成系统提示（私聊/群聊区分） ----------
+def persona_for(key: str) -> str:
+    """按会话 key 选人格：私密账号用私密人格，其余（含全部群聊）用主人格。
+
+    群聊 key 形如 "g:123"，私聊 key 就是纯 uid 字符串；私密人格只对私聊生效，
+    所以这里用 isdigit 把群聊排除在外。"私密人格未配置"时 PRIVATE_PERSONA 是空串，
+    自然回落到主人格。
+    """
+    if PRIVATE_PERSONA and key.isdigit() and int(key) in PRIVATE_PERSONA_WHITELIST:
+        return PRIVATE_PERSONA
+    return PERSONA
+
+
 def build_system_content(key: str) -> str:
     if key.startswith("g:"):
-        base = PERSONA + (
+        base = persona_for(key) + (
             "\n\n【场景说明】你现在在一个QQ群里，群成员都能看到你发的每一条消息。"
             "你可以保持俏皮和亲近感，但内容必须适合公开场合——"
             "不要说太私人、太露骨的话，也不要透露私密信息。"
@@ -695,7 +756,7 @@ def build_system_content(key: str) -> str:
             f"“{ROBOT_NAME}：”、“{ROBOT_NAME}（QQ号）：”、“{ROBOT_NAME}:”、“[{ROBOT_NAME}（QQ号）]：”等类似格式的前缀，直接输出内容本身。"
         )
     else:
-        base = PERSONA
+        base = persona_for(key)
 
     # 行为约束统一在这里承载。它们原来混在人设文件末尾的特殊要求里，
     # 与人格正文互相干扰，而且"不要输出时间戳"这类规则在两边各写了一遍。
@@ -1175,9 +1236,12 @@ def build_compress_user_prompt(new_text: str, old_facts: list, old_recent: dict,
     )
 
 
-async def update_persona(old_persona: str, facts: list, recent: dict,
+async def update_persona(key: str, old_persona: str, facts: list, recent: dict,
                          dialog_tail: str) -> str | None:
     """更新 persona（"你心里的事"）—— 一次独立的角色内省调用。
+
+    key 用来决定注入哪份人格：心事是"以那个人格为底长出来的"，私密账号必须用
+    私密人格，否则写出来的心事会跑到主人格身上。
 
     为什么和记忆整理分开跑：整理是理性结构化（输出 JSON、按桶取舍），
     写心事是进入角色（输出自由文本、允许推翻旧的自己）。两种思维模式混在一次调用里
@@ -1213,7 +1277,7 @@ async def update_persona(old_persona: str, facts: list, recent: dict,
     facts_text = "\n".join(lines) or "（还没有）"
 
     system = (
-        PERSONA
+        persona_for(key)
         + "\n\n──────────\n"
         "上面是你的人设。接下来要写的不是资料整理，而是你自己的心事。\n"
         "没有人会看到你写的东西——这不是给别人看的说明，是你自己心里的话。"
@@ -1434,6 +1498,7 @@ async def compress_memory(key: str, gen: int) -> None:
         # 放在 facts 提交之后、且不在锁内：它是一次额外的 LLM 调用（长耗时），
         # 而且即使失败，本次记忆整理的成果也已经落盘了。
         new_persona = await update_persona(
+            key,
             old_persona=persona_snapshot["old"],
             facts=persona_snapshot["facts"],
             recent=persona_snapshot["recent"],
@@ -2201,7 +2266,8 @@ async def handle_message(ws, data: dict):
         return
 
     if mtype == "private":
-        if uid not in PRIVATE_WHITELIST:
+        # 私密私聊白名单与私聊白名单互不重叠，准入判定取两者的并集
+        if uid not in PRIVATE_WHITELIST and uid not in PRIVATE_PERSONA_WHITELIST:
             return
         key = str(uid)
 
@@ -2309,7 +2375,7 @@ async def proactive_loop_private(ws):
                 log.info(f"当前北京时间 {now_hour} 点，处于静音时段，跳过主动私聊")
                 continue
 
-        for uid in PRIVATE_WHITELIST:
+        for uid in PRIVATE_WHITELIST | PRIVATE_PERSONA_WHITELIST:
             if random.random() > PROACTIVE_TO_EACH:
                 continue
             key = str(uid)
@@ -2442,6 +2508,11 @@ async def main():
                  f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}）；"
                  f"近期流水保留最近 {LM_RECENT_DAYS} 个聊过的日子 / 最多 {LM_RECENT_MAX_ITEMS} 条；"
                  f"心事（persona）上限 {LM_PERSONA_MAX_CHARS} 字；存储于 {LM_FILE}")
+        log.info(f"群聊 L0 与私聊共用同一窗口参数（上限 {LM_L0_MAX} 条 / 每次 {LM_COMPRESS_COUNT} 条），"
+                 f"但群聊只截断丢弃，不压缩、不写入 L1")
+    log.info(f"人格：主人格 {CFG.get('persona_file') or '（config.persona 内嵌）'}"
+             + (f"；私密人格 {_ppf}，适用 {sorted(PRIVATE_PERSONA_WHITELIST)}"
+                if PRIVATE_PERSONA else "；私密人格未启用，全部账号使用主人格"))
     log.info(f"正在连接 NapCat: {WS_URL}")
     if AUTO_RELOGIN:
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"

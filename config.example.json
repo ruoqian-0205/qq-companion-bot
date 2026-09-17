@@ -1,6 +1,8 @@
 {
   "bot_name": "小深",
   "persona_file": "persona.txt",
+  "private_persona_file": "",
+  "private_persona_whitelist": [],
 
   "ws_url": "ws://127.0.0.1:3001",
   "text_base_url": "https://api.deepseek.com",
@@ -42,7 +44,6 @@
   "qr_detect_timeout": 20,
   "scan_prompt_timeout": 300,
 
-  "memory_max_messages": 40,
   "memory_file": "memory.json",
   "enable_silent_hours": true,
   "silent_hours_start": 0,
