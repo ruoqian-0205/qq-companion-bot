@@ -78,12 +78,31 @@ GROUP_WHITELIST = set(_WHITELIST.get("group", []))
 # ---- group_chat：群聊行为 ----
 _GROUP = _group("group_chat")
 GROUP_AT_ONLY = _GROUP.get("at_only", True)
-GROUP_REPLY_PROBABILITY = _GROUP.get("reply_probability", 0.8)
-GROUP_KEYWORD_PROBABILITY = _GROUP.get("keyword_probability", 0.7)
-GROUP_ACTIVE_PROBABILITY = _GROUP.get("active_probability", 0.6)
-GROUP_DEFAULT_PROBABILITY = _GROUP.get("default_probability", 0.1)
-GROUP_ACTIVE_WINDOW = _GROUP.get("active_window", 600)
-GROUP_MAX_CONSECUTIVE_REPLIES = _GROUP.get("max_consecutive_replies", 5)
+# ---- 群聊回复概率：由"双热度"演变驱动，没有分段固定概率 ----
+# 两个热度回答两个不同尺度的问题：
+#   fast（短半衰期）—— 此刻是不是正在刷屏
+#   slow（长半衰期）—— 这段时间群里有没有人气
+# 概率 = p_min + (p_max - p_min) × (1-fast) × (1-slow)
+# 于是"冷群捧场""热聊避让""刚说完话就安静"全是同一套演变的结果，
+# 不需要各自独立的惩罚项 / 奖励项。
+GROUP_P_MAX = _GROUP.get("p_max", 0.7)                          # 两个热度都 0（群最冷清）时
+GROUP_P_MIN = _GROUP.get("p_min", 0.05)                         # 最饱和时
+GROUP_HEAT_PER_MESSAGE = _GROUP.get("heat_per_message", 0.15)   # 每条群友消息抬升热度
+GROUP_HEAT_FAST_HALF_LIFE = _GROUP.get("heat_fast_half_life_seconds", 120)
+GROUP_HEAT_SLOW_HALF_LIFE = _GROUP.get("heat_slow_half_life_seconds", 1800)
+GROUP_SELF_BUMP = _GROUP.get("self_bump", 0.5)                  # 机器人发言后抬升（只抬 fast）
+# ---- 介入深度（engage）：有没有人在跟我说话 ----
+# 概率取两个"想说话的理由"里更强的那个：
+#   p_ambient —— 群里冷清，我想水群
+#   p_engage  —— 有人跟我说话（被 @ / 叫名字 / 接我的话 / 提到关键词），我想回应
+# 被牵扯一次 engage 升一截，对话继续则继续升高（受 room 抑制，不会死钉在满值）；
+# 没人再理它时 engage 按半衰期衰减，概率最终交回给热度函数，而不是掉到极低值。
+GROUP_ENGAGE_PEAK = _GROUP.get("engage_peak", 0.95)              # engage 满时的概率
+GROUP_ENGAGE_UP = _GROUP.get("engage_up", 0.75)                  # 被 @ / 紧跟它发言的话
+GROUP_ENGAGE_KEYWORD = _GROUP.get("engage_keyword", 0.45)        # 命中关键词时升多少
+GROUP_ENGAGE_SELF_DAMP = _GROUP.get("engage_self_damp", 0.45)    # 机器人发言后 engage 乘它
+GROUP_ENGAGE_FOLLOWUP_WINDOW = _GROUP.get("engage_followup_seconds", 30)
+GROUP_ENGAGE_HALF_LIFE = _GROUP.get("engage_half_life_seconds", 90)
 KEYWORDS = _GROUP.get("keywords", [])
 
 # ---- proactive：主动消息 ----
@@ -326,11 +345,16 @@ vision_client = AsyncOpenAI(
 # 记忆：key 为 "私聊QQ号" 或 "g:群号"
 memories: dict[str, list[dict]] = {}
 
-# 群聊活跃期记录：群号 -> 到期时间戳
-group_active_until: dict[int, float] = {}
+# 群聊热度：群号 -> {"fast": 0~1, "slow": 0~1, "t": 上次更新时间}
+# 惰性衰减：读取时按距上次的时间补算，所以不需要定时任务。
+group_heat: dict[int, dict] = {}
 
-# 群聊连续回复计数：群号 -> 次数
-group_consecutive_replies: dict[int, int] = {}
+# 介入深度：群号 -> {"v": engage(0~1), "t": 上次结算时刻}
+# 与热度互补：热度看"群里多热闹"，engage 看"有没有人在跟我说话"。
+group_engage: dict[int, dict] = {}
+
+# 机器人上次在各群发言的时刻，用于判断"有人正在接它的话"
+bot_spoke_at: dict[int, float] = {}
 
 # 会话最后活动时间：key -> 时间戳，用于主动消息的静默期判断。
 # 注意：机器人自己发出的**主动消息不更新**它，否则机制会把自己永久抑制住。
@@ -761,12 +785,113 @@ async def append_memory(key: str, role: str, content: str):
                     f"已丢弃最早 {dropped} 条（说明长期记忆压缩持续失败，请检查 API 与配置）")
     save_memory()
 
-# ---------- 群聊活跃期 ----------
-def set_group_active(gid: int):
-    group_active_until[gid] = time.time() + GROUP_ACTIVE_WINDOW
+# ---------- 群聊热度与概率 ----------
+def _bump(v: float, amount: float) -> float:
+    """把热度朝 1 抬一截（边际递减，永远到不了 1）。"""
+    return v + amount * (1.0 - v)
 
-def is_group_active(gid: int) -> bool:
-    return time.time() < group_active_until.get(gid, 0)
+
+def _heat_of(gid: int) -> dict:
+    """取该群的热度状态，并按距上次的时间补算衰减。
+
+    惰性衰减：不跑定时任务，只在读取时结算 —— 没人说话的群本来就不需要计算。
+    """
+    now = time.time()
+    st = group_heat.get(gid)
+    if st is None:
+        st = {"fast": 0.0, "slow": 0.0, "t": now}
+        group_heat[gid] = st
+        return st
+    dt = now - st["t"]
+    if dt > 0:
+        st["fast"] *= 0.5 ** (dt / GROUP_HEAT_FAST_HALF_LIFE)
+        st["slow"] *= 0.5 ** (dt / GROUP_HEAT_SLOW_HALF_LIFE)
+        st["t"] = now
+    return st
+
+
+def note_group_message(gid: int) -> None:
+    """记下一条**群友之间在聊**的消息，抬升两个热度。
+
+    注意：只在"这条不是在跟机器人说话"时调用。若是跟它对话，那属于 engage 的
+    范畴 —— 若也计进热度，对话越久热度越高、ambient 越低，等于机器人聊着聊着
+    把自己压没了，正好和"该聊天时不冷场"相反。
+    """
+    st = _heat_of(gid)
+    st["fast"] = _bump(st["fast"], GROUP_HEAT_PER_MESSAGE)
+    st["slow"] = _bump(st["slow"], GROUP_HEAT_PER_MESSAGE)
+
+
+def note_bot_spoke(gid: int) -> None:
+    """机器人自己在该群发出了一条消息：**只**抬快热度。
+
+    "我刚说过话"是短期事件，不该污染"这个群有没有人气"这个长期判断 ——
+    若连 slow 一起抬，说完一句会让它在接下来半小时里都异常安静。
+    """
+    st = _heat_of(gid)
+    st["fast"] = _bump(st["fast"], GROUP_SELF_BUMP)
+    # 关键：我说完话之后 engage 应当**下降**（轮到对方了），而不是上升。
+    # 若让它上升就是正反馈 —— 越说越想说的资格越高，冷群里会演变成刷屏。
+    v = _engage_of(gid) * GROUP_ENGAGE_SELF_DAMP
+    group_engage[gid] = {"v": v, "t": time.time()}
+    bot_spoke_at[gid] = time.time()
+
+
+# ---------- 介入深度（engage）----------
+def _engage_of(gid: int) -> float:
+    """取该群的介入深度，并按距上次的时间补算衰减。"""
+    now = time.time()
+    rec = group_engage.get(gid)
+    if rec is None:
+        return 0.0
+    v = rec["v"] * 0.5 ** ((now - rec["t"]) / GROUP_ENGAGE_HALF_LIFE)
+    rec["v"] = v
+    rec["t"] = now
+    return v
+
+
+def _engage_add(gid: int, amount: float) -> None:
+    """把介入深度抬高一截（上限 1）。"""
+    v = min(1.0, _engage_of(gid) + amount)
+    group_engage[gid] = {"v": v, "t": time.time()}
+
+
+def note_group_engage(gid: int, mentioned: bool, text: str, nickname: str) -> bool:
+    """按这一条群消息更新介入深度，并返回"这条是不是在跟机器人说话"。
+
+    被 @ 或"紧跟在我发言之后"（大概率在接我的话）都按满幅抬升；命中关键词抬
+    得少一些（提到名字不等于在跟我说话）。返回值的用途见调用点：在跟它说话时
+    不该再去抬热度，否则等于自己把自己压下去。
+    """
+    if mentioned:
+        _engage_add(gid, GROUP_ENGAGE_UP)
+        return True
+    last = bot_spoke_at.get(gid)
+    if last is not None and time.time() - last < GROUP_ENGAGE_FOLLOWUP_WINDOW:
+        # 群里越热闹，"紧跟在我发言之后"越可能只是巧合而非在接我的话，所以按
+        # 群友的活跃度打折。否则热聊时它插一句就会被当成开了场对话，之后窗口内
+        # 所有人的话都算"在接它" —— 那正是要避免的过度插话。
+        #
+        # 这里必须用 slow 而不是 fast：fast 会被机器人自己的发言抬高（防连发），
+        # 用它当折扣就会变成"我越说话越认不出对方在接我"，与不冷场直接冲突。
+        credit = 1.0 - _heat_of(gid)["slow"]
+        if credit > 0.5:
+            # 群里不热闹，且这句话紧跟在我发言之后 → 大概率是在接我的话。
+            # 把这次机会用掉：只有紧接着的那一条算，否则窗口内连续几条都会被
+            # 算成对话、engage 被反复顶满，那正是要避免的过度插话。
+            # （note_bot_spoke 每次都会重置时间戳，所以对话继续时下一轮仍能识别。）
+            bot_spoke_at.pop(gid, None)
+            # 增量随 engage 存量递减：已经很高时几乎补不动。否则"衰减↔补满"
+            # 会形成一个死循环（冷群里 credit 恒为 1），机器人跟一个群友无限对聊。
+            room = 1.0 - _engage_of(gid)
+            _engage_add(gid, GROUP_ENGAGE_UP * credit * (0.25 + 0.75 * room))
+            return True
+        # credit 太低说明群友之间正聊得热，这句话八成不是接它的，落回下面判定
+    if keyword_boost(text, nickname):
+        _engage_add(gid, GROUP_ENGAGE_KEYWORD)
+        return False        # 只是提到名字，可能是在跟别人聊
+    return False
+
 
 # ---------- 关键词检测 ----------
 def keyword_boost(text: str, nickname: str) -> bool:
@@ -774,21 +899,22 @@ def keyword_boost(text: str, nickname: str) -> bool:
         return False
     return any(k in text for k in KEYWORDS)
 
-# ---------- 群聊概率计算 ----------
+
 def group_reply_probability(gid: int, mentioned: bool, text: str, nickname: str) -> float:
+    """算这一条群消息的回复概率，**不修改任何状态**。
+
+    调用顺序很关键：必须用"此前积累的热度"判断这一条该不该回，热度等判定完
+    再更新。反过来的话，死群里的第一条消息会先把自己的热度抬起来、把自己的
+    概率打下去，而第一条恰恰是最该捧场的那条。
+    """
     if mentioned:
-        return GROUP_REPLY_PROBABILITY
+        return 1.0          # 被点名必定回复：独立于下面所有机制
 
-    if not is_group_active(gid):
-        group_consecutive_replies[gid] = 0
-        if keyword_boost(text, nickname):
-            return GROUP_KEYWORD_PROBABILITY
-        return GROUP_DEFAULT_PROBABILITY
-
-    if group_consecutive_replies.get(gid, 0) >= GROUP_MAX_CONSECUTIVE_REPLIES:
-        return GROUP_DEFAULT_PROBABILITY
-
-    return GROUP_ACTIVE_PROBABILITY
+    st = _heat_of(gid)
+    raw = (1.0 - st["fast"]) * (1.0 - st["slow"])
+    p_ambient = GROUP_P_MIN + (GROUP_P_MAX - GROUP_P_MIN) * raw
+    p_engage = GROUP_ENGAGE_PEAK * _engage_of(gid)
+    return max(0.0, min(1.0, max(p_ambient, p_engage)))
 
 # ---------- 生成系统提示（私聊/群聊区分） ----------
 def _is_inner_key(key: str) -> bool:
@@ -832,12 +958,17 @@ def build_system_content(key: str) -> str:
             "你可以保持俏皮和亲近感，但内容必须适合公开场合——"
             "不要说太私人、太露骨的话，也不要透露私密信息。"
             "对话中带【昵称（QQ号）】前缀的是不同的人在说话，可以用昵称称呼对方，但绝对不要用QQ号。"
-            "\n【先判断这句话是不是在对你说的】群里绝大多数消息是群友之间的闲聊，**不是跟你说话**，"
-            "不要每句都接。真正算「在跟你说话」的只有这几种："
-            f"① 消息里出现「@{ROBOT_NAME}」；② 直接叫了你的名字；③ 明显在接你上一句（比如回答你刚问的问题）。"
-            "对话里形如「@某某」的是群友在叫另一个人，那是他们之间的事，**不要当成在叫你**，"
-            "也不要替被叫的人回答；两个群友互相聊起来时，安静听着就好，只在真的有意思时才轻轻插一句。"
-            "拿不准的时候，一律当作不是在跟你说话。"
+            "\n【你在群里的位置】群里大部分时间大家在互相聊，你只是其中一个成员，"
+            "不是每句话的发言人或主持人。这一轮要不要开口由程序判断——"
+            "既然轮到你说话了，就自然地说，**绝对不要输出**「（默默看着）」「（不参与）」"
+            "「（一旁听着）」这类旁白，也不要说「我只是路过」之类的话。"
+            "\n你开口的处境通常是两种之一，语气要对上："
+            f"① 有人直接找你（消息里有「@{ROBOT_NAME}」、叫了你的名字、或在接你上一句）"
+            "→ 你就是对话的一方，正常回应他，可以反问、接梗、追问。"
+            "② 没人找你，你只是想插一句（话题你感兴趣、有人提到你熟悉的东西）"
+            "→ 你是「刚凑过来的那个人」：顺着话题接一句、起个哄、问问他们在聊什么都可以，"
+            "但不要替别人回答问题，也不要假装知道你没看到的前因——"
+            "群里形如「@某某」的是群友在叫另一个人，那是他们之间的事。"
             "\n【群聊回复格式】你是以第一人称直接对群友说话，回复时绝对不要使用"
             f"“{ROBOT_NAME}：”、“{ROBOT_NAME}（QQ号）：”、“{ROBOT_NAME}:”、“[{ROBOT_NAME}（QQ号）]：”等类似格式的前缀，直接输出内容本身。"
         )
@@ -2172,21 +2303,35 @@ async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
         return ""
 
 # ---------- 主动消息 ----------
-async def proactive_chat(msgs: list[dict]) -> str | None:
-    """基于给定快照生成一句主动开场白。本函数不落盘，由调用方在持锁状态下追加记忆。"""
+async def proactive_chat(msgs: list[dict], key: str) -> str | None:
+    """基于给定快照生成一句主动开场白。本函数不落盘，由调用方在持锁状态下追加记忆。
+
+    按 key 区分私聊/群聊：群聊里这句话是"说给一屋子人听"的，
+    不能写成私下找某个人搭话的口吻。
+    """
     now_str = get_beijing_time_str()
     msgs = list(msgs)
-    msgs.append({"role": "user",
-                 "content": f"【当前时间】北京时间 {now_str}\n"
-                            "（现在没在和人对话，你想再跟对方说句话。"
-                            "说一句简短、自然、贴合人设的话，像随手发条 QQ 消息；"
-                            "不要长篇大论，也不要提到'自动'或'机器人'）"})
+    if key.startswith("g:"):
+        hint = ("（此时你可能是因为空闲无聊，或者是想活跃一下群里的气氛，"
+                "或者其他原因，想在群里冒一下泡。你现在可以在群聊里说一句简短的话，"
+                "或者发送多条消息，但请不要长篇大论——"
+                "消息是给群里的大家看的，不是给某一个人看的。）")
+    else:
+        hint = ("（此时你可能是因为空闲无聊，或者其他原因，想主动找对方说话。"
+                "你现在可以说一句简短的话，也可以发送多条消息，但不要长篇大论。）")
+    # 主动消息是凭空发起的，"为什么突然开口"最容易出戏：模型会去解释动机，
+    # 或者不小心把自己是自动程序这件事说漏。两条都堵掉。
+    hint += "不要解释你为什么突然开口，也不要提到「自动」「机器人」这类词。"
+    msgs.append({"role": "user", "content": f"【当前时间】北京时间 {now_str}\n{hint}"})
     try:
         resp = await client.chat.completions.create(
             model=TEXT_MODEL,
             messages=msgs,
             temperature=1.3,
-            max_tokens=200,
+            # 预算是"思考 + 正文"的总和。主动消息在引导语里明确允许连发多条，
+            # 200 只够两三条短句，真要多说几句就会撞上限被硬截断（半句话照发）。
+            # 它只是上限、按实际输出计费，调大不增加日常成本。
+            max_tokens=400,
             extra_body={"thinking": {"type": "enabled" if ENABLE_THINKING else "disabled"}},
         )
         return clean_reply((resp.choices[0].message.content or "").strip())
@@ -2291,7 +2436,7 @@ async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> b
     data = await call_napcat(ws, "send_group_msg",
                              {"group_id": gid, "message": message})
     if data and data.get("message_id"):
-        set_group_active(gid)
+        note_bot_spoke(gid)
         return True
     log.error(f"群消息发送失败 gid={gid} 回执={data} 内容={text[:60]!r}")
     return False
@@ -2449,10 +2594,21 @@ async def handle_message(ws, data: dict):
         if GROUP_AT_ONLY and not mentioned:
             return
 
+        # 顺序：先按本条更新介入深度 → 用旧状态算概率 → 再记账。
+        # "在跟机器人说话"与"群友之间在聊"是两件事：前者抬 engage，后者抬热度，
+        # 分开记，否则对话会把自己的热度顶高、反过来把自己压没。
+        talking_to_me = note_group_engage(gid, mentioned, combined_text, nickname)
         prob = group_reply_probability(gid, mentioned, combined_text, nickname)
+        st = _heat_of(gid)
+        fast, slow = st["fast"], st["slow"]      # 快照，日志要用
+        eng = _engage_of(gid)
+        if not talking_to_me:
+            note_group_message(gid)
+
         if random.random() > prob:
-            log.info(f"群 {gid} 按概率跳过回复")
-            group_consecutive_replies[gid] = 0
+            log.info(f"群 {gid} 跳过（p={prob:.3f}｜冷清度={(1 - fast) * (1 - slow):.2f}"
+                     f"｜fast={fast:.2f} slow={slow:.2f}｜engage={eng:.2f}"
+                     f"｜{'对我说话' if talking_to_me else '群友闲聊'}）")
             return
 
         # 生成前在线检查（同私聊）
@@ -2460,7 +2616,8 @@ async def handle_message(ws, data: dict):
             log.warning(f"账号离线，跳过本次群聊回复 {gid}（不调用模型，不写入记忆）")
             return
 
-        group_consecutive_replies[gid] = group_consecutive_replies.get(gid, 0) + 1
+        # 注：机器人发言后的热度抬升在 send_group_msg 成功时记账（note_bot_spoke），
+        # 所以这里不再需要计数 —— 原来的"连发上限"已由那条负反馈自然取代。
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
         sent_parts = await send_assistant_reply(ws, reply, gid=gid,
@@ -2507,7 +2664,7 @@ async def proactive_loop_private(ws):
                 continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
-            reply = await proactive_chat(reply_msgs)
+            reply = await proactive_chat(reply_msgs, key)
             if not reply:
                 continue
             sent_parts = await send_assistant_reply(ws, reply, uid=uid)
@@ -2546,7 +2703,7 @@ async def proactive_loop_group(ws):
                 continue
             async with get_mem_lock(key):
                 reply_msgs = build_reply_msgs(key, None)
-            reply = await proactive_chat(reply_msgs)
+            reply = await proactive_chat(reply_msgs, key)
             if not reply:
                 continue
             sent_parts = await send_assistant_reply(ws, reply, gid=gid)

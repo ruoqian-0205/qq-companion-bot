@@ -31,13 +31,20 @@
 
   "group_chat": {
     "at_only": true,
-    "reply_probability": 0.8,
-    "keyword_probability": 0.7,
-    "active_probability": 0.6,
-    "default_probability": 0.1,
-    "active_window": 600,
-    "max_consecutive_replies": 5,
-    "keywords": ["小深", "猫娘"]
+    "keywords": ["小深", "猫娘"],
+
+    "p_max": 0.7,
+    "p_min": 0.05,
+    "heat_per_message": 0.15,
+    "heat_fast_half_life_seconds": 120,
+    "heat_slow_half_life_seconds": 1800,
+    "self_bump": 0.5,
+    "engage_peak": 0.95,
+    "engage_up": 0.75,
+    "engage_keyword": 0.45,
+    "engage_self_damp": 0.45,
+    "engage_followup_seconds": 30,
+    "engage_half_life_seconds": 90
   },
 
   "proactive": {
