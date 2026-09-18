@@ -2515,8 +2515,9 @@ async def delete_one_msg(ws, mid: str) -> bool:
     """撤回一条消息。失败只记日志、不抛 —— 撤回失败不该中断整条流程。"""
     data = await call_napcat(ws, "delete_msg", {"message_id": str(mid)})
     if data is None:
-        # call_napcat 超时或没拿到回执
-        log.warning(f"撤回无回执（可能超时或已过期）mid={mid}")
+        # 只有"根本没收到回执"才会走到这里 —— 回执到了但没有 data 字段的情况，
+        # 在 WS 回执处理那里已经变成空 dict 了，那种是成功。所以这里是请求超时。
+        log.warning(f"撤回请求超时（没收到后端回执）mid={mid}")
         return False
     status = str(data.get("status") or "ok") if isinstance(data, dict) else "ok"
     if status in ("failed", "error"):
@@ -2980,7 +2981,13 @@ async def main():
                         if echo and echo in pending_actions:
                             fut = pending_actions.pop(echo)
                             if not fut.done():
-                                fut.set_result(data.get("data"))
+                                # 回执到了、但里面可能没有 data 字段（delete_msg 就是
+                                # 这样：撤回成功却不回内容）。这时要回一个空 dict，
+                                # 而不是 None —— 调用方靠 None 区分"超时/根本没收到
+                                # 回执"，若把"成功但无返回内容"也变成 None，就会把
+                                # 成功当失败，撤回会一直重试同一条。
+                                payload = data.get("data")
+                                fut.set_result(payload if payload is not None else {})
                             continue
                         if data.get("post_type") == "message":
                             asyncio.create_task(safe_handle_message(ws, data))
