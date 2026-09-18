@@ -2543,17 +2543,24 @@ async def drop_memory_by_mid(key: str, mid: str) -> int:
 
 
 async def cmd_recall_last(ws, key: str) -> int:
-    """c撤回：撤回机器人本会话最后一条消息，并删掉对应记忆。返回成功条数。"""
+    """c撤回：撤回机器人本会话最后一条消息，并删掉对应记忆。返回成功条数。
+
+    无论成败都把它从登记表里出栈：撤不掉的（超过 QQ 可撤回时限、或已被手动
+    撤回）应当**跳过**，否则下一次 c撤回还会撞在同一条上、永远退不回上上条。
+    这也正是"再发一次 c撤回 却撤不掉上上条"的原因。
+    撤不掉时**不删记忆** —— 消息还在聊天里，记忆就该留着。
+    """
     mids = bot_sent_mids.get(key) or []
     if not mids:
         log.info(f"c撤回：{key} 没有可撤回的记录")
         return 0
-    mid = mids[-1]
+    mid = mids.pop()
     if await delete_one_msg(ws, mid):
-        mids.pop()
         await drop_memory_by_mid(key, mid)
-        log.info(f"c撤回：已撤回 {key} 的最后一条 mid={mid}")
+        log.info(f"c撤回：已撤回 {key} 的最后一条 mid={mid}，还剩 {len(mids)} 条可撤")
         return 1
+    log.warning(f"c撤回：mid={mid} 撤不掉（多半已超过 QQ 的可撤回时限，或那条已被"
+                f"手动撤回），已跳过它，还剩 {len(mids)} 条可撤")
     return 0
 
 
