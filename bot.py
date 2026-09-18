@@ -336,6 +336,11 @@ group_consecutive_replies: dict[int, int] = {}
 # 注意：机器人自己发出的**主动消息不更新**它，否则机制会把自己永久抑制住。
 last_activity: dict[str, float] = {}
 
+# 群成员的 QQ -> 昵称。用来把消息里的 at 段还原成可读的「@张三」——
+# OneBot 的 at 段只带 QQ 号、不带昵称，没有这张表就只能写成「@QQ123456」，
+# 而提示词里明确要求不要用 QQ 号称呼人。表从收到的群消息里累积。
+nickname_by_qq: dict[int, str] = {}
+
 # NapCat API 请求-响应匹配:echo -> asyncio.Future
 pending_actions: dict[str, asyncio.Future] = {}
 
@@ -827,6 +832,12 @@ def build_system_content(key: str) -> str:
             "你可以保持俏皮和亲近感，但内容必须适合公开场合——"
             "不要说太私人、太露骨的话，也不要透露私密信息。"
             "对话中带【昵称（QQ号）】前缀的是不同的人在说话，可以用昵称称呼对方，但绝对不要用QQ号。"
+            "\n【先判断这句话是不是在对你说的】群里绝大多数消息是群友之间的闲聊，**不是跟你说话**，"
+            "不要每句都接。真正算「在跟你说话」的只有这几种："
+            f"① 消息里出现「@{ROBOT_NAME}」；② 直接叫了你的名字；③ 明显在接你上一句（比如回答你刚问的问题）。"
+            "对话里形如「@某某」的是群友在叫另一个人，那是他们之间的事，**不要当成在叫你**，"
+            "也不要替被叫的人回答；两个群友互相聊起来时，安静听着就好，只在真的有意思时才轻轻插一句。"
+            "拿不准的时候，一律当作不是在跟你说话。"
             "\n【群聊回复格式】你是以第一人称直接对群友说话，回复时绝对不要使用"
             f"“{ROBOT_NAME}：”、“{ROBOT_NAME}（QQ号）：”、“{ROBOT_NAME}:”、“[{ROBOT_NAME}（QQ号）]：”等类似格式的前缀，直接输出内容本身。"
         )
@@ -2196,6 +2207,25 @@ def is_quiet_period(key: str, quiet_seconds: float) -> tuple[bool, float]:
     return idle < quiet_seconds, idle
 
 # ---------- 消息解析 ----------
+def _at_text(qq) -> str:
+    """把 at 段还原成可读文本。
+
+    OneBot 的 at 段只带 QQ 号、不带昵称，直接拼出来是「@QQ123456」，而提示词里
+    明确要求不要用 QQ 号称呼人。所以优先查昵称表（从群消息里累积），查不到才退化。
+    @全体成员的 qq 是字符串 "all"。
+    """
+    s = str(qq)
+    if s == "all":
+        return "@全体成员"
+    if s == str(BOT_QQ):
+        return f"@{ROBOT_NAME}"
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return f"@{s}"
+    return f"@{nickname_by_qq.get(n, f'QQ{n}')}"
+
+
 def extract_message(raw) -> tuple[str, list[dict]]:
     """
     从消息中提取纯文本和图片信息列表。
@@ -2208,6 +2238,10 @@ def extract_message(raw) -> tuple[str, list[dict]]:
             seg_type = seg.get("type")
             if seg_type == "text":
                 text += seg.get("data", {}).get("text", "")
+            elif seg_type == "at":
+                # at 段原先被直接丢弃，于是"谁 @ 了谁"完全进不了记忆 ——
+                # 模型因此分不清群友之间的互动和对自己说话，看到 @ 就以为在叫它。
+                text += _at_text(seg.get("data", {}).get("qq"))
             elif seg_type == "image":
                 data = seg.get("data", {})
                 url = data.get("url")
@@ -2337,8 +2371,14 @@ async def handle_message(ws, data: dict):
     else:
         combined_text = text
 
+    # 群里"只 @ 不说话"（at 段之后没有文本）时 combined_text 会是空的。
+    # 但 @ 本身就是一句招呼，这种情况必须放行，并给模型一个明确的占位内容 ——
+    # 否则它会面对一条空的用户消息，不知道对方在干什么。
+    mentioned_only = (mtype == "group" and is_mentioned(raw_message, BOT_QQ))
     if not combined_text.strip():
-        return
+        if not mentioned_only:
+            return
+        combined_text = "（只是@了你一下，没说什么）"
 
     if mtype == "private":
         # 里人格账号与私聊白名单互不重叠，准入判定取两者的并集
@@ -2391,6 +2431,8 @@ async def handle_message(ws, data: dict):
 
         sender = data.get("sender", {})
         nickname = sender.get("card") or sender.get("nickname") or str(uid)
+        # 累积 QQ -> 昵称，供 _at_text 把 at 段还原成「@昵称」
+        nickname_by_qq[uid] = nickname
         formatted_text = f"[{nickname}（QQ{uid}）]：{combined_text}"
 
         if "清空记忆" in text:
