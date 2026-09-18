@@ -146,6 +146,11 @@ KILL_QQ_ON_EXIT = _BACKEND.get("kill_qq_on_exit", True)
 _MEMORY = _group("memory")
 MEMORY_FILE = _MEMORY.get("file", "memory.json")
 
+# 撤回（c撤回 / y一键撤回）。y 一次最多撤这么多条、每条之间隔这么久 ——
+# 快速连续调 delete_msg 容易被 QQ 风控，而且一条指令跑太久体验也差。
+RECALL_MAX = _BOT.get("recall_max", 20)
+RECALL_INTERVAL = _BOT.get("recall_interval", 0.8)
+
 # 多段回复（模型用换行分隔时，按段依次发送多条消息）。
 # 模型用换行表示"再发一条"，一次回复变成先后几条短消息，更接近真人在 QQ 上连发几句。
 _SPLIT = _MEMORY.get("split_reply") or {}
@@ -355,6 +360,12 @@ group_engage: dict[int, dict] = {}
 
 # 机器人上次在各群发言的时刻，用于判断"有人正在接它的话"
 bot_spoke_at: dict[int, float] = {}
+
+# 机器人自己发出、且还留着 message_id 的消息：会话 key -> [mid, ...]（新消息在末尾）。
+# 供 c撤回（撤最后一条）与 y一键撤回 使用。只存内存：重启后撤不了更早的消息，
+# 这与 QQ 自身对可撤回时限的约束方向一致。每个会话最多记 BOT_MID_KEEP 条。
+bot_sent_mids: dict[str, list[str]] = {}
+BOT_MID_KEEP = 200
 
 # 会话最后活动时间：key -> 时间戳，用于主动消息的静默期判断。
 # 注意：机器人自己发出的**主动消息不更新**它，否则机制会把自己永久抑制住。
@@ -753,8 +764,11 @@ def trim_l0(key: str, limit: int, batch: int) -> int:
     return batch
 
 
-async def append_memory(key: str, role: str, content: str):
+async def append_memory(key: str, role: str, content: str, mid: str | None = None):
     """追加一条记忆（带时间前缀）。
+
+    mid 是这条消息在 QQ 侧的 message_id。记下来是为了支持撤回同步：别人撤回
+    某条消息时，能据此把 L0 里对应的条目也删掉（留着会让模型以为对方讲过）。
 
     时间戳写入行为与改造前完全一致；区别只在于本函数改为 async，并要求调用方持有该 key 的锁，
     从而保证"追加 + 落盘"是原子的，避免同一用户连发消息时互相覆盖。
@@ -767,7 +781,10 @@ async def append_memory(key: str, role: str, content: str):
     """
     time_str = get_beijing_time_str()
     content = f"[{time_str}] {content}"
-    memories.setdefault(key, []).append({"role": role, "content": content})
+    item = {"role": role, "content": content}
+    if mid:
+        item["mid"] = str(mid)
+    memories.setdefault(key, []).append(item)
     if key.startswith("g:"):
         # 群聊：截断即丢弃，不调模型、不写入 L1
         dropped = trim_l0(key, LM_L0_MAX, LM_COMPRESS_COUNT)
@@ -1607,7 +1624,7 @@ async def compress_memory(key: str, gen: int) -> None:
         # 事实库是整体重写的，"空结果"有两种伤害——覆盖既有记忆；或者旧库本来就空时，
         # 白删掉 seg_len 条 L0 却什么都没记住（冷启动时最容易撞上）。
         # 两种情况都直接放弃本次压缩，L0 与 L1 都不动，等下一轮达到阈值再试。
-        # （真正想清空请用"清空记忆"指令，那条路径是显式且原子的。）
+        # （真正想清空请用"q清空记忆"指令，那条路径是显式且原子的。）
         if not facts:
             if old_facts:
                 log.warning(f"长期记忆（{key}）：本次整理结果为空，但已有 {len(old_facts)} 条既有事实，"
@@ -2424,21 +2441,23 @@ def is_mentioned(raw, self_id: int) -> bool:
     return False
 
 # ---------- 发消息 ----------
-async def send_private_msg(ws, uid: int, text: str) -> bool:
-    """发送私聊消息，返回是否确认送达。
+async def send_private_msg(ws, uid: int, text: str) -> str | None:
+    """发送私聊消息。成功返回 message_id，失败返回 None。
 
     改用带 echo 的请求-响应模式：只有拿到 NapCat 的 message_id 才算送达成功。
     改造前是单向发送，发送失败也是静默的——会把没送出去的话写进记忆。
+    返回值从一开始的 bool 改成 message_id，是为了让调用方能记住它、支持撤回。
     """
     data = await call_napcat(ws, "send_private_msg",
                              {"user_id": uid, "message": text})
-    if data and data.get("message_id"):
-        return True
+    mid = data.get("message_id") if data else None
+    if mid:
+        return str(mid)
     log.error(f"私聊发送失败 uid={uid} 回执={data} 内容={text[:60]!r}")
-    return False
+    return None
 
-async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> bool:
-    """发送群聊消息，返回是否确认送达（判定同 send_private_msg）。"""
+async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> str | None:
+    """发送群聊消息。成功返回 message_id，失败返回 None（判定同 send_private_msg）。"""
     if at_qq is not None:
         message = [{"type": "at", "data": {"qq": str(at_qq)}},
                    {"type": "text", "data": {"text": " " + text}}]
@@ -2446,38 +2465,147 @@ async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> b
         message = text
     data = await call_napcat(ws, "send_group_msg",
                              {"group_id": gid, "message": message})
-    if data and data.get("message_id"):
+    mid = data.get("message_id") if data else None
+    if mid:
         note_bot_spoke(gid)
-        return True
+        return str(mid)
     log.error(f"群消息发送失败 gid={gid} 回执={data} 内容={text[:60]!r}")
-    return False
+    return None
 
-async def send_assistant_reply(ws, text: str,
+async def send_assistant_reply(ws, text: str, key: str,
                                uid: int | None = None,
                                gid: int | None = None,
-                               at_qq: int | None = None) -> list[str]:
-    """把回复按换行拆分后依次发送，返回**已成功送达**的段。
+                               at_qq: int | None = None) -> list[tuple[str, str]]:
+    """把回复按换行拆分后依次发送，返回**已成功送达**的 (段内容, message_id)。
 
     调用方据此决定写入记忆的内容：只记真正发出去的，避免"没送达却被当成说过了"。
     多段之间加随机延迟，一是更像真人打字，二是避免连续发送触发风控。
+    顺手把 message_id 记进 bot_sent_mids，供 c撤回 / y一键撤回 使用。
     """
     parts = split_reply(text)
-    sent: list[str] = []
+    sent: list[tuple[str, str]] = []
     for i, part in enumerate(parts):
         if i > 0 and SPLIT_REPLY_INTERVAL[1] > 0:
             await asyncio.sleep(random.uniform(*SPLIT_REPLY_INTERVAL))
         if gid is not None:
-            ok = await send_group_msg(ws, gid, part, at_qq=at_qq)
+            mid = await send_group_msg(ws, gid, part, at_qq=at_qq)
         else:
-            ok = await send_private_msg(ws, uid, part)
-        if ok:
-            sent.append(part)
+            mid = await send_private_msg(ws, uid, part)
+        if mid:
+            sent.append((part, mid))
+            remember_sent_mid(key, mid)
         else:
             log.warning(f"第 {i + 1}/{len(parts)} 段发送失败，后续段落停止发送")
             break
     if len(parts) > 1:
         log.info(f"回复拆分为 {len(parts)} 条发送，成功 {len(sent)} 条")
     return sent
+
+
+# ---------- 撤回 ----------
+def remember_sent_mid(key: str, mid: str) -> None:
+    """记下机器人刚发出去的一条 message_id（供撤回用）。"""
+    lst = bot_sent_mids.setdefault(key, [])
+    lst.append(str(mid))
+    if len(lst) > BOT_MID_KEEP:
+        del lst[:-BOT_MID_KEEP]
+
+
+async def delete_one_msg(ws, mid: str) -> bool:
+    """撤回一条消息。失败只记日志、不抛 —— 撤回失败不该中断整条流程。"""
+    data = await call_napcat(ws, "delete_msg", {"message_id": str(mid)})
+    if data is None:
+        # call_napcat 超时或没拿到回执
+        log.warning(f"撤回无回执（可能超时或已过期）mid={mid}")
+        return False
+    status = str(data.get("status") or "ok") if isinstance(data, dict) else "ok"
+    if status in ("failed", "error"):
+        log.warning(f"撤回失败 mid={mid} 回执={data}")
+        return False
+    return True
+
+
+async def drop_memory_by_mid(key: str, mid: str) -> int:
+    """把 L0 里 message_id 匹配的条目删掉（撤回时用）。返回删除条数。
+
+    只动 L0：L1 里的内容是被模型压缩改写过的间接表述，已经无法对应回某条消息。
+    """
+    async with get_mem_lock(key):
+        lst = memories.get(key)
+        if not lst:
+            return 0
+        before = len(lst)
+        memories[key] = [m for m in lst if str(m.get("mid") or "") != str(mid)]
+        n = before - len(memories[key])
+        if n:
+            save_memory()
+    return n
+
+
+async def cmd_recall_last(ws, key: str) -> int:
+    """c撤回：撤回机器人本会话最后一条消息，并删掉对应记忆。返回成功条数。"""
+    mids = bot_sent_mids.get(key) or []
+    if not mids:
+        log.info(f"c撤回：{key} 没有可撤回的记录")
+        return 0
+    mid = mids[-1]
+    if await delete_one_msg(ws, mid):
+        mids.pop()
+        await drop_memory_by_mid(key, mid)
+        log.info(f"c撤回：已撤回 {key} 的最后一条 mid={mid}")
+        return 1
+    return 0
+
+
+async def cmd_recall_all(ws, key: str) -> int:
+    """y一键撤回：撤回机器人本会话发过的消息（最多 RECALL_MAX 条）。返回成功条数。
+
+    从最新往回撤；每条之间隔 RECALL_INTERVAL 秒，避免快速连续调用触发风控。
+    """
+    mids = bot_sent_mids.get(key) or []
+    if not mids:
+        log.info(f"y一键撤回：{key} 没有可撤回的记录")
+        return 0
+    todo = list(reversed(mids[-RECALL_MAX:]))
+    done: list[str] = []
+    for i, mid in enumerate(todo):
+        if i:
+            await asyncio.sleep(RECALL_INTERVAL)
+        if await delete_one_msg(ws, mid):
+            done.append(mid)
+    if done:
+        done_set = set(done)
+        bot_sent_mids[key] = [m for m in mids if m not in done_set]
+        for mid in done:
+            await drop_memory_by_mid(key, mid)
+    log.info(f"y一键撤回：{key} 尝试 {len(todo)} 条，成功 {len(done)} 条")
+    return len(done)
+
+
+async def handle_recall(ws, data: dict) -> None:
+    """有人在私聊/群里撤回了消息 → 把 L0 里对应的那条也删掉。
+
+    撤回的含义是"这条话没说过"，记忆里留着会让模型以为对方讲过。
+    """
+    mid = str(data.get("message_id") or "")
+    if not mid:
+        return
+    if data.get("notice_type") == "group_recall":
+        key = f"g:{data.get('group_id')}"
+    else:
+        key = str(data.get("user_id"))
+    n = await drop_memory_by_mid(key, mid)
+    if n:
+        log.info(f"撤回同步：{key} 已删除 {n} 条记忆（mid={mid}）")
+    else:
+        log.info(f"撤回同步：{key} 未找到 mid={mid} 的记忆条目（未记录或已滚出窗口）")
+
+
+async def safe_handle_recall(ws, data: dict) -> None:
+    try:
+        await handle_recall(ws, data)
+    except Exception:
+        log.exception("处理撤回事件时出错")
 
 # ---------- 事件处理 ----------
 async def handle_message(ws, data: dict):
@@ -2544,14 +2672,21 @@ async def handle_message(ws, data: dict):
 
         # 阶段 1（持锁）：写入用户消息 → 判断是否触发压缩 → 取本轮请求快照
         async with get_mem_lock(key):
-            if "清空记忆" in text:
+            if "q清空记忆" in text:
                 clear_long_memory(key)   # 清 L0 + L1，并让在途压缩作废
                 if not await send_private_msg(ws, uid, clear_memory_reply_for(key)):
                     # 记忆确实已清空，只是回复没送出去；记日志以免用户以为没生效而反复发
-                    log.warning(f"清空记忆已执行，但确认回复未送达 uid={uid}")
+                    log.warning(f"q清空记忆已执行，但确认回复未送达 uid={uid}")
+                return
+            if "c撤回" in text:
+                await cmd_recall_last(ws, key)     # 静默执行，不回话
+                return
+            if "y一键撤回" in text:
+                await cmd_recall_all(ws, key)      # 静默执行，不回话
                 return
 
-            await append_memory(key, "user", combined_text)
+            await append_memory(key, "user", combined_text,
+                                data.get("message_id"))
             maybe_schedule_compress(key)
             # 快照必须在写入本条消息之后取，否则当前这条会漏出上下文
             reply_msgs = build_reply_msgs(key, None)
@@ -2570,11 +2705,11 @@ async def handle_message(ws, data: dict):
 
         # 阶段 3：先发送、确认送达后才写记忆 —— 送不出去的话不该被当成"已经说过"
         # 回复可能含换行分隔的多条，逐条发送；只把成功送达的段记进 L0
-        sent_parts = await send_assistant_reply(ws, reply, uid=uid)
+        sent_parts = await send_assistant_reply(ws, reply, key, uid=uid)
         if sent_parts:
             async with get_mem_lock(key):
-                for part in sent_parts:
-                    await append_memory(key, "assistant", part)
+                for part, mid in sent_parts:
+                    await append_memory(key, "assistant", part, mid)
         else:
             log.warning(f"私聊回复未送达，不写入记忆（避免后续对话基于未发生的内容）uid={uid}")
 
@@ -2591,15 +2726,22 @@ async def handle_message(ws, data: dict):
         nickname_by_qq[uid] = nickname
         formatted_text = f"[{nickname}（QQ{uid}）]：{combined_text}"
 
-        if "清空记忆" in text:
+        if "q清空记忆" in text:
             clear_long_memory(key)
             if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY_OUTER,
                                         at_qq=uid if mentioned else None):
-                log.warning(f"清空记忆已执行，但确认回复未送达 gid={gid}")
+                log.warning(f"q清空记忆已执行，但确认回复未送达 gid={gid}")
+            return
+        if "c撤回" in text:
+            await cmd_recall_last(ws, key)         # 静默执行，不回话
+            return
+        if "y一键撤回" in text:
+            await cmd_recall_all(ws, key)          # 静默执行，不回话
             return
 
         async with get_mem_lock(key):
-            await append_memory(key, "user", formatted_text)
+            await append_memory(key, "user", formatted_text,
+                                data.get("message_id"))
             reply_msgs = build_reply_msgs(key, None)
 
         if GROUP_AT_ONLY and not mentioned:
@@ -2631,12 +2773,12 @@ async def handle_message(ws, data: dict):
         # 所以这里不再需要计数 —— 原来的"连发上限"已由那条负反馈自然取代。
         reply, _ok = await chat_with_deepseek(key, reply_msgs)
 
-        sent_parts = await send_assistant_reply(ws, reply, gid=gid,
+        sent_parts = await send_assistant_reply(ws, reply, key, gid=gid,
                                                 at_qq=uid if mentioned else None)
         if sent_parts:
             async with get_mem_lock(key):
-                for part in sent_parts:
-                    await append_memory(key, "assistant", part)
+                for part, mid in sent_parts:
+                    await append_memory(key, "assistant", part, mid)
         else:
             log.warning(f"群回复未送达，不写入记忆 gid={gid}")
 
@@ -2678,11 +2820,11 @@ async def proactive_loop_private(ws):
             reply = await proactive_chat(reply_msgs, key)
             if not reply:
                 continue
-            sent_parts = await send_assistant_reply(ws, reply, uid=uid)
+            sent_parts = await send_assistant_reply(ws, reply, key, uid=uid)
             if sent_parts:
                 async with get_mem_lock(key):
-                    for part in sent_parts:
-                        await append_memory(key, "assistant", part)
+                    for part, mid in sent_parts:
+                        await append_memory(key, "assistant", part, mid)
             else:
                 log.warning(f"主动私聊未送达，不写入记忆 uid={uid}")
 
@@ -2717,11 +2859,11 @@ async def proactive_loop_group(ws):
             reply = await proactive_chat(reply_msgs, key)
             if not reply:
                 continue
-            sent_parts = await send_assistant_reply(ws, reply, gid=gid)
+            sent_parts = await send_assistant_reply(ws, reply, key, gid=gid)
             if sent_parts:
                 async with get_mem_lock(key):
-                    for part in sent_parts:
-                        await append_memory(key, "assistant", part)
+                    for part, mid in sent_parts:
+                        await append_memory(key, "assistant", part, mid)
             else:
                 log.warning(f"主动群聊未送达，不写入记忆 gid={gid}")
 
@@ -2730,12 +2872,12 @@ async def debug_console():
     load_memory()
     load_long_memory()
     print("=== 调试模式 ===")
-    print("输入内容测试人设；输入 清空记忆 忘记上下文；输入 q 退出\n")
+    print("输入内容测试人设；输入 q清空记忆 忘记上下文；输入 q 退出\n")
     while True:
         text = input("你: ").strip()
         if text.lower() == "q":
             break
-        if "清空记忆" in text:
+        if "q清空记忆" in text:
             clear_long_memory("debug")
             print(f"{ROBOT_NAME}: {CLEAR_MEMORY_REPLY_OUTER}\n")
             continue
@@ -2835,6 +2977,10 @@ async def main():
                             continue
                         if data.get("post_type") == "message":
                             asyncio.create_task(safe_handle_message(ws, data))
+                        elif data.get("post_type") == "notice":
+                            # 撤回通知：SnowLuma 与 NapCat 的字段名一致
+                            if data.get("notice_type") in ("friend_recall", "group_recall"):
+                                asyncio.create_task(safe_handle_recall(ws, data))
                 finally:
                     for t in tasks:
                         t.cancel()
