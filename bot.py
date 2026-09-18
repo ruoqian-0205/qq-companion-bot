@@ -150,6 +150,12 @@ MEMORY_FILE = _MEMORY.get("file", "memory.json")
 # 快速连续调 delete_msg 容易被 QQ 风控，而且一条指令跑太久体验也差。
 RECALL_MAX = _BOT.get("recall_max", 20)
 RECALL_INTERVAL = _BOT.get("recall_interval", 0.8)
+# c撤回 最多连续尝试多少条：QQ 侧的撤回时限（约 2 分钟）是硬的，过期的 mid
+# 永远撤不掉，一次 c撤回 只弹一条的话会被它卡住、表现为"发了没反应"。
+RECALL_MAX_TRY = _BOT.get("recall_max_try", 8)
+# 重启后从 L0 重建登记表时，只认这段时间内发过的消息 —— 更早的必然已过
+# QQ 撤回时限，恢复它们只会让 c撤回 挨个去撞墙。
+RECALL_RESTORE_WINDOW = _BOT.get("recall_restore_window_seconds", 1800)
 
 # 多段回复（模型用换行分隔时，按段依次发送多条消息）。
 # 模型用换行表示"再发一条"，一次回复变成先后几条短消息，更接近真人在 QQ 上连发几句。
@@ -549,6 +555,53 @@ def load_memory():
 
 def save_memory():
     _atomic_write_json(MEMORY_FILE, memories)
+
+
+def _entry_age_seconds(item: dict) -> float | None:
+    """取一条 L0 条目"发了多久"（秒）。时间戳解析不出来就返回 None。
+
+    时间前缀由 append_memory 写入，格式与 get_beijing_time_str 一致
+    （YYYY-MM-DD HH:MM 周X，无秒）。用来判断一条消息是否还值得登记进撤回表。
+    """
+    head = (item.get("content") or "")[:17]          # "[2026-09-18 15:41"
+    try:
+        t = datetime.strptime(head, "[%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    now = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    return (now - t).total_seconds()
+
+
+def restore_bot_sent_mids():
+    """从 L0 恢复"机器人自己发过的 message_id"。
+
+    bot_sent_mids 只存内存，重启后就空了 —— 那会让重启前刚发的消息撤不回来。
+    而 L0 里每条 assistant 消息本来就记着 mid，直接读回来即可，不必另外落盘。
+
+    **只恢复 RECALL_RESTORE_WINDOW 秒以内的**：QQ 侧的撤回时限是硬的（约 2 分钟），
+    把几小时前的 mid 也塞进登记表，等于给 c撤回 摆一长串必败的目标 ——
+    每按一次都去撞一次墙，正是"发了没反应"的由来。
+    """
+    total = 0
+    skipped = 0
+    for key, lst in memories.items():
+        if not isinstance(lst, list):
+            continue
+        mids = []
+        for m in lst:
+            if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("mid")):
+                continue
+            age = _entry_age_seconds(m)
+            if age is not None and age > RECALL_RESTORE_WINDOW:
+                skipped += 1
+                continue
+            mids.append(str(m["mid"]))
+        if mids:
+            bot_sent_mids[key] = mids[-BOT_MID_KEEP:]
+            total += len(bot_sent_mids[key])
+    if total or skipped:
+        log.info(f"已从记忆恢复 {total} 条可撤回的消息记录（分布在 {len(bot_sent_mids)} 个会话）；"
+                 f"另有 {skipped} 条已超过 QQ 可撤回时限，未恢复")
 
 def _as_bool(v) -> bool:
     """把模型可能给出的各种"真值写法"归一成 bool。
@@ -1002,6 +1055,9 @@ def build_system_content(key: str) -> str:
         "\n- 你只能发文字和图片消息，无法发语音、打电话、打视频，也无法和对方在现实里见面。"
         "\n- 你可以连续发送多条消息。"
         "\n- 所有事件、信息只能根据已有信息判断，不得无中生有。"
+        "\n- 你始终只以**自己的身份、自己的口吻**说话，绝不要串台成对方或任何群友："
+        "记录里对方的发言是他说的话，不是你说的——不要替他说话、不要续写他的话、"
+        "不要用他的口吻描述他，也不要替他或任何群友作答。"
         "\n- 你的每条回复都应该完全自然，像真人在QQ上聊天一样，不包含任何元信息或格式标记。"
     )
     return base
@@ -2544,25 +2600,35 @@ async def drop_memory_by_mid(key: str, mid: str) -> int:
 
 
 async def cmd_recall_last(ws, key: str) -> int:
-    """c撤回：撤回机器人本会话最后一条消息，并删掉对应记忆。返回成功条数。
+    """c撤回：撤回机器人本会话最后一条**还撤得掉**的消息。返回成功条数。
 
-    无论成败都把它从登记表里出栈：撤不掉的（超过 QQ 可撤回时限、或已被手动
-    撤回）应当**跳过**，否则下一次 c撤回还会撞在同一条上、永远退不回上上条。
-    （这一层针对**永久性失败**：消息已被手动撤回、或已过可撤回时限，它永远撤不掉；
-    另有一种失败是回执被判错，那不是这里处理的，见 delete_one_msg。）
-    撤不掉时**不删记忆** —— 消息还在聊天里，记忆就该留着。
+    与 y一键撤回 共用同一套判定，但语义是"撤掉我刚说的那句"，所以从最新往回找。
+
+    为什么要连续尝试若干条，而不是只弹一条：
+    QQ 侧的撤回时限（约 2 分钟）是硬的 —— 一旦最后一条已经过期，它就永远撤不掉。
+    只弹一条的实现会被这一条**反复卡住**：每按一次 c撤回 都去撞同一面墙，一条消息
+    都不消失，用户看到的就是"发了 c撤回 完全没反应"。而 y一键撤回 因为一次扫一批、
+    撤不掉的跳过，所以同样的过期限额下它看起来一切正常。
+    所以这里也往前找：找到第一条真的撤得掉的为止，中间那些撤不掉的元凶顺手出栈，
+    免得下次再撞。撤不掉的**不删记忆** —— 消息还在聊天里，记忆就该留着。
     """
     mids = bot_sent_mids.get(key) or []
     if not mids:
-        log.info(f"c撤回：{key} 没有可撤回的记录")
+        log.warning(f"c撤回：{key} 没有可撤回的记录（该会话还没发过话）")
         return 0
-    mid = mids.pop()
-    if await delete_one_msg(ws, mid):
-        await drop_memory_by_mid(key, mid)
-        log.info(f"c撤回：已撤回 {key} 的最后一条 mid={mid}，还剩 {len(mids)} 条可撤")
-        return 1
-    log.warning(f"c撤回：mid={mid} 撤不掉（多半已超过 QQ 的可撤回时限，或那条已被"
-                f"手动撤回），已跳过它，还剩 {len(mids)} 条可撤")
+    tried = 0
+    while mids and tried < RECALL_MAX_TRY:
+        mid = mids.pop()               # 先出栈：撤得掉算完事，撤不掉也不该再挡路
+        tried += 1
+        if await delete_one_msg(ws, mid):
+            await drop_memory_by_mid(key, mid)
+            log.info(f"c撤回：已撤回 {key} 的 mid={mid}（尝试 {tried} 条），"
+                     f"还剩 {len(mids)} 条可撤")
+            return 1
+        log.warning(f"c撤回：mid={mid} 撤不掉，继续往前找"
+                    f"（已尝试 {tried}/{RECALL_MAX_TRY} 条）")
+    log.warning(f"c撤回：{key} 连续尝试 {tried} 条都撤不掉 —— 多半都已超过 QQ 的"
+                f"可撤回时限（约 2 分钟），或都已被手动撤回；还剩 {len(mids)} 条记录")
     return 0
 
 
@@ -2573,7 +2639,8 @@ async def cmd_recall_all(ws, key: str) -> int:
     """
     mids = bot_sent_mids.get(key) or []
     if not mids:
-        log.info(f"y一键撤回：{key} 没有可撤回的记录")
+        log.warning(f"y一键撤回：{key} 没有可撤回的记录"
+                    f"（该会话还没发过话，或记录已滚出记忆窗口）")
         return 0
     todo = list(reversed(mids[-RECALL_MAX:]))
     done: list[str] = []
@@ -2591,10 +2658,27 @@ async def cmd_recall_all(ws, key: str) -> int:
     return len(done)
 
 
+def forget_sent_mid(mid: str) -> int:
+    """把某个 mid 从撤回登记表里彻底划掉。返回清理的条数。
+
+    用于"这条消息已经在 QQ 侧消失"的场合：手动撤回、群管理撤回、超时被系统清理。
+    不划掉的话它会变成**永远撤不掉的僵死记录** —— 下次 c撤回 弹到它就必然失败。
+    与"撤不掉时出栈"是两回事：那条是主动撤回失败，这条是被动消失。
+    """
+    n = 0
+    for lst in bot_sent_mids.values():
+        while mid in lst:
+            lst.remove(mid)
+            n += 1
+    return n
+
+
 async def handle_recall(ws, data: dict) -> None:
     """有人在私聊/群里撤回了消息 → 把 L0 里对应的那条也删掉。
 
     撤回的含义是"这条话没说过"，记忆里留着会让模型以为对方讲过。
+    如果被撤回的正好是机器人自己发的（用户手动撤回、群管理撤回），
+    还要把它从撤回登记表里划掉 —— 否则它会变成永远撤不掉的僵死记录。
     """
     mid = str(data.get("message_id") or "")
     if not mid:
@@ -2608,6 +2692,8 @@ async def handle_recall(ws, data: dict) -> None:
         log.info(f"撤回同步：{key} 已删除 {n} 条记忆（mid={mid}）")
     else:
         log.info(f"撤回同步：{key} 未找到 mid={mid} 的记忆条目（未记录或已滚出窗口）")
+    if forget_sent_mid(mid):
+        log.info(f"撤回同步：mid={mid} 已从撤回登记表划掉（这条已在 QQ 侧消失）")
 
 
 async def safe_handle_recall(ws, data: dict) -> None:
@@ -2683,7 +2769,10 @@ async def handle_message(ws, data: dict):
         async with get_mem_lock(key):
             if "q清空记忆" in text:
                 clear_long_memory(key)   # 清 L0 + L1，并让在途压缩作废
-                if not await send_private_msg(ws, uid, clear_memory_reply_for(key)):
+                # 走 send_assistant_reply 而不是裸发：顺带把 mid 登记进撤回表，
+                # 这样确认消息也能被 c撤回 撤掉，不至于成为撤不掉的僵尸记录。
+                # 本轮清空后 L0 已空，它不会写进 L0（撤回时靠 mid 匹配，无需 L0 条目）。
+                if not await send_assistant_reply(ws, clear_memory_reply_for(key), key, uid=uid):
                     # 记忆确实已清空，只是回复没送出去；记日志以免用户以为没生效而反复发
                     log.warning(f"q清空记忆已执行，但确认回复未送达 uid={uid}")
                 return
@@ -2737,8 +2826,9 @@ async def handle_message(ws, data: dict):
 
         if "q清空记忆" in text:
             clear_long_memory(key)
-            if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY_OUTER,
-                                        at_qq=uid if mentioned else None):
+            # 同私聊：走 send_assistant_reply 以便登记 mid
+            if not await send_assistant_reply(ws, CLEAR_MEMORY_REPLY_OUTER, key,
+                                              gid=gid, at_qq=uid if mentioned else None):
                 log.warning(f"q清空记忆已执行，但确认回复未送达 gid={gid}")
             return
         if "c撤回" in text:
@@ -2879,6 +2969,7 @@ async def proactive_loop_group(ws):
 # ---------- 调试模式 ----------
 async def debug_console():
     load_memory()
+    restore_bot_sent_mids()
     load_long_memory()
     print("=== 调试模式 ===")
     print("输入内容测试人设；输入 q清空记忆 忘记上下文；输入 q 退出\n")
@@ -2938,6 +3029,7 @@ def clean_shutdown(force: bool = False) -> None:
 
 async def main():
     load_memory()
+    restore_bot_sent_mids()
     load_long_memory()
     if LONG_MEMORY_ENABLED:
         log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，每次压缩 {LM_COMPRESS_COUNT} 条，"
