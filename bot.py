@@ -2406,10 +2406,21 @@ def extract_message(raw) -> tuple[str, list[dict]]:
     return text, images
 
 def is_mentioned(raw, self_id: int) -> bool:
+    """这一条是否算"在叫机器人"。
+
+    除了 QQ 原生的 @机器人，**@全体成员 也算** —— 这是陪伴性质的机器人，
+    被全体喊到更该冒头当个显眼包，而不是像功能型机器人那样识趣地不插话。
+    （OneBot 里 @全体成员的 at 段 qq 是字符串 "all"。）
+
+    注意仍然**不**包括群友之间的互相 @：只有 qq 等于自己或 "all" 才算。
+    """
     if isinstance(raw, list):
-        return any(seg.get("type") == "at"
-                   and str(seg.get("data", {}).get("qq")) == str(self_id)
-                   for seg in raw)
+        for seg in raw:
+            if seg.get("type") != "at":
+                continue
+            qq = str(seg.get("data", {}).get("qq"))
+            if qq == str(self_id) or qq == "all":
+                return True
     return False
 
 # ---------- 发消息 ----------
