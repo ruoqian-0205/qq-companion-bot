@@ -48,7 +48,11 @@ def _group(name: str) -> dict:
 
 # ---- bot：身份与通用回复行为 ----
 _BOT = _group("bot")
-BOT_QQ = _BOT["qq"]
+# 用 .get 而不是 []：全项目只有这一个键用下标读，缺了会抛 KeyError: 'qq'，
+# 完全看不出是配置问题。启动阶段就给出可读提示，与上面的 API Key 校验一致。
+BOT_QQ = _BOT.get("qq")
+if not BOT_QQ:
+    raise SystemExit("配置错误：config.json 缺少 bot.qq（机器人自己的 QQ 号，必填）")
 ROBOT_NAME = _BOT.get("name", "小深")
 REPLY_PROBABILITY = _BOT.get("reply_probability", 0.7)
 # 固定回复分表/里两套：这两个是**表人格**的基准值，里人格那套在 persona 组里配，
@@ -1086,8 +1090,19 @@ def format_l1_block(key: str) -> str:
     # 第二遍是稳定排序，会保留第一遍的日期降序结果。
     # （不能把 seen 直接塞进同一个元组取负——它是日期字符串，取不了负。）
     # 注意这里只影响注入块里的展示顺序，不再决定"谁被淘汰"：容量由整理时的配额约束。
+    # 防御：facts 里混进非字典（手工编辑、旧格式残留、将来某条写入路径绕过
+    # _clean_l1_facts）时，下面的 f.get / f["c"] 会抛 AttributeError ——
+    # 而本函数**每轮私聊都会调用**，一旦抛出该用户的对话就全废。
+    # 载入时已经清洗过一遍，这里只是把"整用户级故障"降级成"少一条事实"。
+    # n 也一并规整：排序里的 -f.get("n") 遇到字符串会直接抛
+    # TypeError: bad operand type for unary -: 'str'（手工把 n 写成 "3" 就会触发）。
+    facts = [f for f in facts
+             if isinstance(f, dict) and f.get("c")
+             and not isinstance(f.get("n", 1), bool) and isinstance(f.get("n", 1), int)]
+    if not facts and not recent and not persona:
+        return ""
     ordered = sorted(
-        [f for f in facts if f.get("c")],
+        facts,
         key=lambda f: str(f.get("seen") or ""),
         reverse=True,
     )
@@ -1268,7 +1283,10 @@ async def memory_llm(system: str, user: str) -> str | None:
         try:
             extra = {"thinking": {"type": "enabled" if LM_THINKING else "disabled"}}
             if LM_THINKING:
-                extra["reasoning_effort"] = "low"   # 整理任务不需要高强度推理，够用且更省
+                extra["reasoning_effort"] = "high"
+                # 刻意用 high：整理任务要同时执行「合并重复、累加 n、判断过期、守住分类配额」
+                # 这一整套规则，实测 low 时经常漏掉其中几条（n 不累加、过期条目不清）。
+                # 代价是推理 token 会占用 max_tokens 预算，所以 LM_REASONING_MAX_TOKENS 必须留足。
             resp = await memory_client.chat.completions.create(
                 model=TEXT_MODEL,
                 messages=[
@@ -1519,6 +1537,9 @@ async def update_persona(key: str, old_persona: str, facts: list, recent: dict,
         extra = {"thinking": {"type": "enabled" if LM_THINKING else "disabled"}}
         if LM_THINKING:
             extra["reasoning_effort"] = "high"
+            # 刻意用 high：整理任务要同时执行「合并重复、累加 n、判断过期、守住分类配额」
+            # 这一整套规则，实测 low 时经常漏掉其中几条（n 不累加、过期条目不清）。
+            # 代价是推理 token 会占用 max_tokens 预算，所以 LM_REASONING_MAX_TOKENS 必须留足。
         resp = await memory_client.chat.completions.create(
             model=TEXT_MODEL,
             messages=[
@@ -2356,6 +2377,22 @@ async def proactive_chat(msgs: list[dict], key: str) -> str | None:
         return None
 
 
+def in_silent_hours(hour: int) -> bool:
+    """判断某个整点是否落在静音时段内。
+
+    跨夜要能工作：常见配置是"夜里 22 点到早上 6 点别打扰"，此时 start > end，
+    用 `start <= h < end` 判断会恒为 False、静音完全失效（而且毫无提示）。
+    所以 start > end 时按"跨过午夜"处理。
+    """
+    if not ENABLE_SILENT_HOURS:
+        return False
+    if SILENT_HOURS_START == SILENT_HOURS_END:
+        return False          # 起止相同视为未启用，避免"全天静音"这种意外
+    if SILENT_HOURS_START < SILENT_HOURS_END:
+        return SILENT_HOURS_START <= hour < SILENT_HOURS_END
+    return hour >= SILENT_HOURS_START or hour < SILENT_HOURS_END
+
+
 def is_quiet_period(key: str, quiet_seconds: float) -> tuple[bool, float]:
     """判断某会话是否处于"刚聊过天"的静默期。
 
@@ -2672,8 +2709,9 @@ async def proactive_loop_private(ws):
 
         if ENABLE_SILENT_HOURS:
             now_hour = datetime.now(timezone(timedelta(hours=8))).hour
-            if SILENT_HOURS_START <= now_hour < SILENT_HOURS_END:
-                log.info(f"当前北京时间 {now_hour} 点，处于静音时段，跳过主动私聊")
+            if in_silent_hours(now_hour):
+                log.info(f"当前北京时间 {now_hour} 点，处于静音时段"
+                         f"（{SILENT_HOURS_START}~{SILENT_HOURS_END} 点），跳过主动私聊")
                 continue
 
         for uid in PRIVATE_WHITELIST | PERSONA_INNER_ACCOUNTS:
@@ -2711,8 +2749,9 @@ async def proactive_loop_group(ws):
 
         if ENABLE_SILENT_HOURS:
             now_hour = datetime.now(timezone(timedelta(hours=8))).hour
-            if SILENT_HOURS_START <= now_hour < SILENT_HOURS_END:
-                log.info(f"当前北京时间 {now_hour} 点，处于静音时段，跳过主动群聊")
+            if in_silent_hours(now_hour):
+                log.info(f"当前北京时间 {now_hour} 点，处于静音时段"
+                         f"（{SILENT_HOURS_START}~{SILENT_HOURS_END} 点），跳过主动群聊")
                 continue
 
         for gid in GROUP_WHITELIST:
