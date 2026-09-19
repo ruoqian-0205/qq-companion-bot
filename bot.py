@@ -102,7 +102,19 @@ GROUP_SELF_BUMP = _GROUP.get("self_bump", 0.5)                  # 机器人发�
 # 被牵扯一次 engage 升一截，对话继续则继续升高（受 room 抑制，不会死钉在满值）；
 # 没人再理它时 engage 按半衰期衰减，概率最终交回给热度函数，而不是掉到极低值。
 GROUP_ENGAGE_PEAK = _GROUP.get("engage_peak", 0.95)              # engage 满时的概率
-GROUP_ENGAGE_UP = _GROUP.get("engage_up", 0.75)                  # 被 @ / 紧跟它发言的话
+# 被 @ 时补多少介入深度。默认 1.0 = 直接拉满（_engage_add 内部还会 clamp 到 1.0），
+# 而"拉满"意味着被点名必定回复（p = engage_peak * 1.0 ≈ engage_peak）。
+GROUP_ENGAGE_UP = _GROUP.get("engage_up", 1.0)         # 被 @ 时
+# "紧跟在我发言之后"（follow-up）补多少介入深度。
+# 刻意做成固定增量 + room 缩放，而**不是**再乘一个热度折扣：
+#   原实现写的是 `engage_up * credit * (0.25+0.75*room)`，credit = 1-slow。
+#   但 slow（"群今天热不热闹"，半衰期 30 分钟）一旦 > 0.5，credit 就 ≤ 0.5、
+#   判定整个失效 —— 用户接着说话完全不抬 engage，而 engage 早已被机器人自己的
+#   上一次发言压掉一截，于是掉进 ambient 那档，"越聊越不理人"且自己好不了。
+#   实测（同参数）：slow=0.45 → 2.38 轮 / 51% 冷场；slow=0.50 → 0.30 轮 / 75% 冷场。
+#   follow-up 本质是**时间信号**（这句话紧跟着它），与群里热不热闹无关；
+#   热聊时误判的风险由 room 缩放 + bot_spoke_at 的一次性消耗挡住。
+GROUP_ENGAGE_FOLLOWUP = _GROUP.get("engage_up_followup", 0.3)
 GROUP_ENGAGE_KEYWORD = _GROUP.get("engage_keyword", 0.45)        # 命中关键词时升多少
 GROUP_ENGAGE_SELF_DAMP = _GROUP.get("engage_self_damp", 0.45)    # 机器人发言后 engage 乘它
 GROUP_ENGAGE_FOLLOWUP_WINDOW = _GROUP.get("engage_followup_seconds", 30)
@@ -872,25 +884,21 @@ def note_group_engage(gid: int, mentioned: bool, text: str, nickname: str) -> bo
         return True
     last = bot_spoke_at.get(gid)
     if last is not None and time.time() - last < GROUP_ENGAGE_FOLLOWUP_WINDOW:
-        # 群里越热闹，"紧跟在我发言之后"越可能只是巧合而非在接我的话，所以按
-        # 群友的活跃度打折。否则热聊时它插一句就会被当成开了场对话，之后窗口内
-        # 所有人的话都算"在接它" —— 那正是要避免的过度插话。
+        # 这句话紧跟在我发言之后 → 大概率是在接我的话。
+        # 判定只看时间窗口，不再看群热不热闹（原因见 GROUP_ENGAGE_FOLLOWUP 的注释：
+        # 用 slow 当门槛会让"群里聊热之后"永远认不出对话，与不冷场直接冲突）。
         #
-        # 这里必须用 slow 而不是 fast：fast 会被机器人自己的发言抬高（防连发），
-        # 用它当折扣就会变成"我越说话越认不出对方在接我"，与不冷场直接冲突。
-        credit = 1.0 - _heat_of(gid)["slow"]
-        if credit > 0.5:
-            # 群里不热闹，且这句话紧跟在我发言之后 → 大概率是在接我的话。
-            # 把这次机会用掉：只有紧接着的那一条算，否则窗口内连续几条都会被
-            # 算成对话、engage 被反复顶满，那正是要避免的过度插话。
-            # （note_bot_spoke 每次都会重置时间戳，所以对话继续时下一轮仍能识别。）
-            bot_spoke_at.pop(gid, None)
-            # 增量随 engage 存量递减：已经很高时几乎补不动。否则"衰减↔补满"
-            # 会形成一个死循环（冷群里 credit 恒为 1），机器人跟一个群友无限对聊。
-            room = 1.0 - _engage_of(gid)
-            _engage_add(gid, GROUP_ENGAGE_UP * credit * (0.25 + 0.75 * room))
-            return True
-        # credit 太低说明群友之间正聊得热，这句话八成不是接它的，落回下面判定
+        # 把这次机会用掉：只有紧接着的那一条算，否则窗口内连续几条都会被算成对话、
+        # engage 被反复顶满。（note_bot_spoke 每次都会重置时间戳，所以对话继续时
+        # 下一轮仍能识别。）
+        bot_spoke_at.pop(gid, None)
+        # 增量随 engage 存量递减：已经很高时几乎补不动。否则"衰减↔补满"会形成
+        # 死循环，机器人跟一个群友无限对聊 —— 这是防刷屏的主要手段，
+        # 实测 up=0.3 时最长连发约 30 轮，up=0.4 时约 60 轮。
+        room = 1.0 - _engage_of(gid)
+        if room > 0.02:          # 已经接近满值就不必再补，留出自然收尾的余地
+            _engage_add(gid, GROUP_ENGAGE_FOLLOWUP * (0.35 + 0.65 * room))
+        return True      # ← 必须在 if 之外：时间窗口命中就是"在跟我说话"
     if keyword_boost(text, nickname):
         _engage_add(gid, GROUP_ENGAGE_KEYWORD)
         return False        # 只是提到名字，可能是在跟别人聊
