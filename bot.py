@@ -788,6 +788,11 @@ async def append_memory(key: str, role: str, content: str,
     否则没有任何机制收口，上下文会无限增长。
     """
     time_str = get_beijing_time_str()
+    # 统一过滤认不出的表情标记：{表情:瞎编} / {瞎编} 整个删掉，认得出的原样保留。
+    # 收在 append_memory 是因为它是**所有**入 L0 路径的唯一入口（用户消息、模型回复、
+    # 主动消息都经过它）—— 改一处就够，也保证 L0 里不会残留假标记。
+    if role in ("user", "assistant"):
+        content = scrub_face_marks(content)
     content = f"[{time_str}] {content}"
     item = {"role": role, "content": content}
     if mid:
@@ -1021,14 +1026,11 @@ def build_system_content(key: str) -> str:
         "\n- 你只能以你自己的角色发送一条或者多条消息。"
         "\n- 所有事件、信息只能根据已有信息判断，不得无中生有。"
         "\n- 你的每条回复都应该完全自然，像真人在QQ上聊天一样，不包含任何元信息或格式标记。"
-        "\n- 对话记录里的「{表情:xxx}」表示对方发了一个QQ表情（xxx 是它的名字）。"
-        "这是系统标记，你**绝对不要**在自己的回复里写这种格式。"
-        "看到表情就当作对方的一个语气/情绪来理解、自然回应即可，不必专门说「你发了个表情」。"
-        "\n- 你可以发的QQ表情有：" + face_legend() + "。"
-        "想用表情就把它写在**句子里**，用花括号包住名字，例如「你说得对{狗头}」。"
-        "规则：**表情必须夹在文字中间**，不能单独成一条、也不要连续发两个；"
-        "不认识的名字会原样发出去，所以只用上面列出的那些。"
-        "表情是点缀，一句话最多一个，多数时候不用 —— 别每句都加。"
+                "\n- 你可以发的QQ表情有：" + face_legend() + "。"
+        "想发哪个就写 {表情:名字}（和你在对话记录里看到的一模一样），"
+        "例如「你说得对{表情:狗头}」。写在句末、单独发一个、或放在开头都可以。"
+        "名字记不清就别写 —— 写错的名字会被丢掉，那句话就白说了。"
+        "表情是点缀，多数时候不用 —— 别每句都加。"
     )
     return base
 
@@ -2558,86 +2560,122 @@ def face_mark(fid) -> str:
 
 
 def face_legend() -> str:
-    """给提示词用的表情清单：显示名（官方标签不同的额外标注）。"""
-    parts = []
-    for _fid, (official, shown) in sorted(QQ_FACES.items()):
-        parts.append(shown if shown == official else f"{shown}(QQ叫「{official}」)")
-    return "、".join(parts)
+    """给提示词用的表情清单：**只给显示名**。
+
+    刻意不带「QQ 官方叫「龇牙」」这类对照 —— 那是给人看的出处信息，对模型没用：
+    代码侧已经做名字→id 的映射，模型只需知道能写哪些名字。塞进提示词只是
+    白占 token、增加它的认知负担。（官方标签仍留在 QQ_FACES 里作为实测来源的记录。）
+    """
+    return "、".join(shown for _fid, (_official, shown) in sorted(QQ_FACES.items()))
 
 
 
-# ---------- 表情发送 ----------
-# 模型输出的表情标记：{狗头}。与识别侧的 {表情:xxx} 是不同形态，不会撞。
-FACE_OUT_RE = re.compile(r"\{([^{}]{1,12})\}")
+# ---------- 表情标记 ----------
+# 模型写的标记与存进 L0 的标记**是同一种写法**：{表情:比心}。
+# 一种写法、零转换 —— 模型在对话记录里看到什么，自己就照着写什么。
+# 另外兼容不带前缀的 {比心}（旧写法/模型偶尔的简写），两种都认。
+FACE_MARK_RE = re.compile(r"\{(?:表情:)?([^{}]{1,12})\}")
 # 名字 → id（由实测的 id 表反查，避免再维护第二份映射）
 FACE_ID_BY_NAME = {shown: fid for fid, (_official, shown) in QQ_FACES.items()}
 
 
-def _text_has_content(text: str) -> bool:
-    """这段文本除了空白/标点之外，还有没有真实内容。"""
-    return bool(re.sub(r"[\s，。！？、…~—·,.!?]+", "", text or ""))
+def face_mark(fid) -> str:
+    """拼出表情标记：名字 → {表情:名字}。
 
-
-def build_message_payload(text: str, at_qq=None):
-    """把带 {表情名} 的文本转成 OneBot 消息（字符串或段数组）。
-
-    **只有"文本里确实有内容"时才解析表情**：否则 {狗头} 单独成条会被发成
-    一个纯表情消息，而用户明确要求"表情必须跟文字"。这条规则由代码强制，
-    不依赖模型自觉 —— 不满足就当普通文字发出去（对方看到的是 {狗头} 字样）。
-
-    返回可以直接塞进 send_* 的 message 字段。
+    **认不出的 id 返回空串（整个不写字）**。理由：模型看到 {表情:234}
+    只能理解为"一个我不认识的表情"，等于往上下文塞噪声 —— 既没提供信息，
+    又占 token，还可能干扰它对语气的判断。与其记个占位符，不如不记。
     """
-    segs = []
-    pos = 0
-    for m in FACE_OUT_RE.finditer(text or ""):
-        name = m.group(1).strip()
-        fid = FACE_ID_BY_NAME.get(name)
-        if fid is None:
-            continue         # 认不出的名字：不解析，留着当普通文字
-        before = text[pos:m.start()]
-        if before:
-            segs.append({"type": "text", "data": {"text": before}})
-        segs.append({"type": "face", "data": {"id": str(fid)}})
+    name = face_display_name(fid)
+    return f"{{表情:{name}}}" if name else ""
+
+
+def _face_name_of(match) -> str | None:
+    """从一个标记里取出**能识别**的表情名；认不出返回 None。
+
+    两种写法都收：`{表情:比心}` 与 `{比心}`。这里是唯一的判定点 ——
+    过滤（不发送）与入库（不进 L0）都用它，不会出现两处逻辑不一致。
+    """
+    name = match.group(1).strip()
+    return name if name in FACE_ID_BY_NAME else None
+
+
+def scrub_face_marks(text: str) -> str:
+    """规范化文本里的表情标记，一次替换同时做两件事：
+
+      · 认得出的 → 统一写成 {表情:名字}  （{比心} 也会被规范成 {表情:比心}）
+      · 认不出的 → **整个删掉**
+
+    "删掉"是用户要求：模型瞎编的名字不该当文字发出去（对方会看到 {瞎编}
+    这种字面量），也不该以 {表情:瞎编} 的形式混进 L0 冒充有效标记。
+
+    "统一"是为了让 L0 只有一种写法：用户发的（extract_message 生成）和
+    模型写的最终都是 {表情:名字}，模型回忆时不会看到两种形态。
+    """
+    def repl(m):
+        name = _face_name_of(m)
+        return f"{{表情:{name}}}" if name else ""
+    return FACE_MARK_RE.sub(repl, text or "")
+
+
+def _strip_face_padding(text: str) -> str:
+    """去掉表情标记两侧多余的空格。
+
+    模型常见输出 `行吧 {表情:狗头}` —— 文本段会带着尾随空格，渲染出来表情前
+    就多一个空格（用户实测反馈）。只吃紧贴标记的空白，不动句子内部正常的空格。
+    """
+    return re.sub(r"[ \t]*(\{(?:表情:)?[^{}]{1,12}\})[ \t]*",
+                  lambda m: m.group(1), text or "")
+
+
+def build_message_segments(text: str) -> tuple[list, bool]:
+    """把文本转成 OneBot 段数组。返回 (segments, 是否含表情段)。
+
+    流程：过滤瞎编的标记 → 去空格 → 逐个标记转成 face 段。
+    表情可以出现在句末、单独一条、或段首（用户要求位置自由）。
+    """
+    text = _strip_face_padding(scrub_face_marks(text))
+    segs, pos = [], 0
+    for m in FACE_MARK_RE.finditer(text):
+        name = _face_name_of(m)
+        if name is None:
+            continue                      # 兜底：上面已过滤，这里不该命中
+        if m.start() > pos:
+            segs.append({"type": "text", "data": {"text": text[pos:m.start()]}})
+        segs.append({"type": "face", "data": {"id": str(FACE_ID_BY_NAME[name])}})
         pos = m.end()
-    tail = (text or "")[pos:]
-    if tail:
-        segs.append({"type": "text", "data": {"text": tail}})
+    if pos < len(text):
+        segs.append({"type": "text", "data": {"text": text[pos:]}})
 
-    # 决定到底解不解析成表情段。三条都由代码强制，不指望模型自觉：
-    #   ① 段里得有表情
-    #   ② 段里得有真实文字（否则整条退回纯文本，{狗头} 原样显示）
-    #   ③ 第一个段不能是表情（"必须夹在文字中间"：段首那个不解析）
-    use_faces = any(s["type"] == "face" for s in segs)
-    if use_faces and not any(s["type"] == "text" and _text_has_content(s["data"]["text"])
-                             for s in segs):
-        log.info(f"忽略了单独的表情标记（要求表情必须跟文字）：{text[:40]!r}")
-        use_faces = False
-    # 段首那个表情退回当文字：要求"夹在文字中间"，它前面没有文字就不合规。
-    # 只退这一个，后面的合法标记照常解析（{狗头}行吧{大笑} 里的 {大笑} 仍然生效）。
-    if use_faces and segs and segs[0]["type"] == "face":
-        fid = segs[0]["data"]["id"]
-        back = next((n for n, i in FACE_ID_BY_NAME.items() if str(i) == str(fid)), "")
-        log.info(f"句首的表情按普通文字发（要求夹在文字中间）：{text[:40]!r}")
-        segs[0] = {"type": "text", "data": {"text": "{" + back + "}"}}
-
-    # 合并相邻 text 段：段首表情退回文字后会出现 [text][text] 这种，
-    # OneBot 允许但没必要，合起来更干净
+    # 相邻 text 段合并（表情两侧都有文字时会产生多段）
     merged = []
     for seg in segs:
-        if (merged and seg["type"] == "text"
-                and merged[-1]["type"] == "text"):
+        if merged and seg["type"] == "text" and merged[-1]["type"] == "text":
             merged[-1]["data"]["text"] += seg["data"]["text"]
         else:
             merged.append(seg)
-    segs = merged
+    return merged, any(s["type"] == "face" for s in merged)
 
-    # 只有这一处拼 @，所有返回路径都经过它 —— 否则某条分支会漏掉 at 段
+
+def build_message_payload(text: str, at_qq=None):
+    """把文本转成可直接塞进 send_* 的 message 字段（字符串或段数组）。
+
+    at 段单独成段、不加前导空格：旧写法给文本前面加一个空格（"@某人 消息"），
+    但正文为空或以表情开头时那个空格就挂在了表情前面，渲染出来很怪。
+    """
+    text = scrub_face_marks(text)
+    segs, use_faces = build_message_segments(text)
     if at_qq is None:
         return segs if use_faces else text
     head = {"type": "at", "data": {"qq": str(at_qq)}}
-    if use_faces:
-        return [head] + segs
-    return [head, {"type": "text", "data": {"text": " " + text}}]
+    return [head] + (segs if use_faces else [{"type": "text", "data": {"text": text}}])
+
+
+def _payload_is_empty(payload) -> bool:
+    """这条消息有没有实际内容可发（空串/纯空白视为没有）。"""
+    if isinstance(payload, str):
+        return not payload.strip()
+    return not payload
 
 
 def extract_message(raw) -> tuple[str, list[dict]]:
@@ -2750,6 +2788,9 @@ async def send_assistant_reply(ws, text: str,
         else:
             mid = await send_private_msg(ws, uid, part)
         if mid:
+            # 模型写的形态**就是**要存的形态（{表情:比心}），无需转换。
+            # 过滤认不出的标记由 append_memory 统一负责 —— 它在所有入 L0 路径的
+            # 汇合点上，收在那里才能保证"无论谁漏了，L0 里都不会有假标记"。
             sent.append((part, mid))
         else:
             log.warning(f"第 {i + 1}/{len(parts)} 段发送失败，后续段落停止发送")
