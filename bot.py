@@ -821,12 +821,12 @@ async def append_memory(key: str, role: str, content: str,
 # 贴到 120 秒去试的话，网络往返 + 服务端处理很可能刚好越过边界而被拒，
 # 用户看到的就是"明明刚发的却说撤不掉"。宁可提前一点判超时。
 RECALL_WINDOW = _BOT.get("recall_window_seconds", 110)
-# y撤回 一次最多撤几条。这只是保险丝，不是"能撤 10 条"的承诺 ——
-# 窗口 110 秒内机器人压根发不出几条（回一句话通常拆成 1~2 条），
-# 所以"y撤回"实际撤到的就是这一两条。给个 5 足够，也防止异常情况下刷请求。
-RECALL_MAX = _BOT.get("recall_max", 5)
-# y撤回 每条之间的间隔：快速连续调 delete_msg 容易被风控。
+# 撤回指令每条之间的间隔：快速连续调 delete_msg 容易被风控。
 RECALL_INTERVAL = _BOT.get("recall_interval", 0.8)
+# 撤回的失败提示挂多久就自动删掉（秒）。
+# 为什么要自删：这类回执只对当下那一刻有意义，留着反而把提醒变成噪音 ——
+# 而且撤回本身是"让消息消失"的操作，回执赖着不走会显得很怪。
+RECALL_TIP_TTL = _BOT.get("recall_tip_ttl", 10)
 
 # ---------- 群聊热度与概率 ----------
 def _bump(v: float, amount: float) -> float:
@@ -2863,6 +2863,33 @@ async def send_assistant_reply(ws, text: str,
 #
 # 硬约束：QQ 允许撤回的时间窗约 2 分钟。因此这里**只处理窗口内的消息**，
 # 超窗的直接判定为不可撤回 —— 不去发那次注定被拒的请求，也不假装成功。
+#
+# 指令（% 前缀，避免和日常聊天内容撞车）：
+#   %#   清空记忆（原"清空记忆"）
+#   %n   撤回 n 条（n 是十进制数字，指"最近 n 条机器人消息"）
+#   %%   撤回全部还撤得掉的（不设条数上限）
+RECALL_CMD_RE = re.compile(r"^%(\d{1,3}|#|%)$")
+
+
+def match_recall_cmd(text: str):
+    """识别撤回/清空指令，返回 ("clear"|"n"|"all", n, 匹配到的原文) 或 None。
+
+    刻意要求**全文匹配**（只有空白可以围绕）：这些都是"一句话就是一条指令"的
+    东西，若允许出现在句子中间，别人聊到"50%的内容"就可能误触发。
+    n 取 1~3 位数字，上限 999 —— 够用，也挡住有人拿超长数字来试探。
+    """
+    s = (text or "").strip()
+    m = RECALL_CMD_RE.match(s)
+    if not m:
+        return None
+    body = m.group(1)
+    if body == "#":
+        return "clear", 0, s
+    if body == "%":
+        return "all", 0, s
+    return "n", int(body), s
+
+
 def _msg_age(ts) -> float | None:
     """一条消息发出多久了（秒）。ts 缺失或非法返回 None（视为不可撤回）。"""
     try:
@@ -2926,41 +2953,53 @@ async def drop_memory_by_mid(key: str, mid: str) -> int:
     return n
 
 
-async def cmd_recall_last(ws, key: str) -> tuple[bool, str]:
-    """c撤回：撤回最近一条还撤得掉的机器人消息。返回 (是否成功, 给用户的话)。
+async def cmd_recall_n(ws, key: str, n: int = 1) -> tuple[bool, str]:
+    """%n：撤回最近 n 条还撤得掉的机器人消息。返回 (是否成功, 给用户的话)。
 
-    只撤最近那一条，失败**就报失败** —— 不自动往前找。理由：
-    "最后一条"应当永远指最后一条，否则用户以为撤掉的是刚才那句、
-    实际撤掉的是更早的某条，反而更难理解。
+    与"撤全部"的区别只在取多少条：都从最近往回数，超窗的天然不在候选里。
+
+    失败策略：**只要一条都没撤成就算失败**，原样报出原因（超窗 / 服务端拒绝）。
+    部分成功不报错 —— 撤掉的那几条用户看得见，为没撤掉的那条再挂一条提示，
+    反而盖住了"确实撤掉了"这个事实。
     """
+    if n <= 0:
+        return True, ""          # %0：合法指令但无事可做，静默
     async with get_mem_lock(key):
-        cands = list_recallable(key)
+        cands = list_recallable(key)[:n]
         if not cands:
             oldest = _newest_bot_msg_age(key)
             if oldest is None:
                 return False, "没有找到我说过的话（可能已被撤回，或早已滚出记忆窗口）"
             return False, (f"最后一条已经发出 {oldest:.0f} 秒，超出 QQ 的"
                            f"可撤回时限（约 {RECALL_WINDOW} 秒），撤不回来了")
-        target = cands[0]
-    ok, why = await delete_one_msg(ws, target["mid"])
-    if not ok:
-        log.warning(f"c撤回 失败（{key}）：mid={target['mid']} {why}")
-        return False, f"撤回失败：{why}"
-    async with get_mem_lock(key):
-        await drop_memory_by_mid(key, target["mid"])
-    log.info(f"c撤回：已撤回 {key} 的最后一条消息 mid={target['mid']}"
-             f"（发出 {target['age']:.0f} 秒前）")
+
+    done = 0
+    last_err = ""
+    for i, c in enumerate(cands):
+        if i:
+            await asyncio.sleep(RECALL_INTERVAL)
+        ok, why = await delete_one_msg(ws, c["mid"])
+        if not ok:
+            last_err = why
+            continue
+        done += 1
+        async with get_mem_lock(key):
+            await drop_memory_by_mid(key, c["mid"])
+    log.info(f"%{n}：{key} 尝试 {len(cands)} 条，成功 {done} 条")
+    if done == 0:
+        return False, f"撤回失败：{last_err or '未能撤回任何一条'}"
     return True, ""
 
 
 async def cmd_recall_all(ws, key: str) -> tuple[int, str]:
-    """y撤回：撤回窗口内全部机器人消息。返回 (成功条数, 给用户的话)。
+    """%%：撤回窗口内全部机器人消息（**不设条数上限**）。返回 (成功条数, 给用户的话)。
 
     从最近往回逐条撤，每条之间隔 RECALL_INTERVAL 防风控。
-    窗口内通常只有一两条，所以"全部"的含义是"还撤得掉的那些"。
+    "全部"的含义是"还撤得掉的"—— 超过 RECALL_WINDOW 的本来就撤不回来，
+    这里不会为一个注定失败的请求白等一轮往返。
     """
     async with get_mem_lock(key):
-        cands = list_recallable(key)[:RECALL_MAX]
+        cands = list_recallable(key)
     if not cands:
         return 0, "没有还撤得掉的消息（超时的撤不回来，这是 QQ 的限制）"
 
@@ -2976,7 +3015,7 @@ async def cmd_recall_all(ws, key: str) -> tuple[int, str]:
         done += 1
         async with get_mem_lock(key):
             await drop_memory_by_mid(key, c["mid"])
-    log.info(f"y撤回：{key} 尝试 {len(cands)} 条，成功 {done} 条")
+    log.info(f"%%：{key} 尝试 {len(cands)} 条，成功 {done} 条")
     if done == 0:
         return 0, f"撤回失败：{last_err or '全部未成功'}"
     return done, ""
@@ -3025,30 +3064,63 @@ async def safe_handle_recall(ws, data: dict) -> None:
         log.exception("处理撤回通知时出错")
 
 
+async def _autodelete_later(ws, mid, ttl: float) -> None:
+    """等 ttl 秒后删掉某条消息（后台任务，绝不阻塞调用方）。"""
+    try:
+        await asyncio.sleep(ttl)
+        ok, why = await delete_one_msg(ws, str(mid))
+        if not ok:
+            log.info(f"撤回回执自动删除失败（mid={mid}）：{why}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:      # noqa: BLE001 —— 后台任务不该把异常抛成告警
+        log.warning(f"撤回回执自动删除异常（mid={mid}）：{e}")
+
+
+async def _send_then_autodelete(ws, text, uid=None, gid=None, at_qq=None,
+                                ttl: float | None = None) -> None:
+    """发一条"回执"类消息，ttl 秒后由后台任务自动撤回。
+
+    为什么不让它留着：撤回指令的回执只在当下有意义（"我撤了 / 我没撤成"），
+    留在聊天里会把提醒变成噪音；而且撤回本身是让消息消失的操作，回执赖着不走很怪。
+    删除走 create_task：**不能在这里 sleep**，否则会把整条消息处理链路拖住 ttl 秒。
+    删不掉也不影响主流程（撤回早已完成），只记日志。
+    """
+    if ttl is None:
+        ttl = RECALL_TIP_TTL
+    if gid is not None:
+        mid = await send_group_msg(ws, gid, text, at_qq=at_qq)
+    else:
+        mid = await send_private_msg(ws, uid, text)
+    if not mid or ttl <= 0:
+        return
+    asyncio.create_task(_autodelete_later(ws, str(mid), ttl))
+
+
 async def run_recall(ws, key: str, uid: int | None = None, gid: int | None = None,
-                     at_qq: int | None = None, mode: str = "last") -> None:
+                     at_qq: int | None = None, mode: str = "n", n: int = 1) -> None:
     """撤回指令的统一入口：执行 + 把结果说给用户。
 
-    反馈策略（用户定的）：**成功静默，失败告知**。
+    mode："n" 撤最近 n 条（%n）；"all" 撤全部可撤的（%%）。
+
+    反馈策略：**成功静默，失败告知**。
     成功时消息在 QQ 里直接消失，用户看得见，机器人再回一句只是噪音；
     失败（超窗 / 被服务端拒绝）则必须说清楚，否则用户以为指令没生效。
-    这条失败提示**不写进记忆** —— 它只是操作回执，不是对话内容。
+    这条失败提示**不写进记忆**（它只是操作回执，不是对话内容），
+    并且**发出 TTL 秒后自动撤回** —— 见 _send_then_autodelete。
     """
     if mode == "all":
-        n, msg = await cmd_recall_all(ws, key)
-        if n:
-            log.info(f"y撤回：{key} 已撤回 {n} 条")
+        cnt, msg = await cmd_recall_all(ws, key)
+        if cnt:
+            log.info(f"%%：{key} 已撤回 {cnt} 条")
             return
     else:
-        ok, msg = await cmd_recall_last(ws, key)
+        ok, msg = await cmd_recall_n(ws, key, n)
         if ok:
-            log.info(f"c撤回：{key} 已撤回最后一条")
+            log.info(f"%{n}：{key} 撤回完成")
             return
     # 走到这里说明失败了：告诉用户原因（顺带说明这是 QQ 的限制，不是指令没生效）
-    if gid is not None:
-        await send_group_msg(ws, gid, msg, at_qq=at_qq)
-    else:
-        await send_private_msg(ws, uid, msg)
+    await _send_then_autodelete(ws, msg, uid=uid, gid=gid, at_qq=at_qq)
 
 
 # ---------- 事件处理 ----------
@@ -3114,23 +3186,22 @@ async def handle_message(ws, data: dict):
             return
         key = str(uid)
 
-        # 撤回指令必须在**拿锁之前**处理：cmd_recall_* 自己会获取同一把锁，
+        # 撤回指令（%n / %%）必须在**拿锁之前**处理：cmd_recall_* 自己会获取同一把锁，
         # 而 asyncio.Lock 不可重入 —— 放在锁内就是自己等自己，永久卡死。
-        # （群聊分支本来就在锁外，只有这里需要注意。）
-        if "c撤回" in text:
-            await run_recall(ws, key, uid=uid, mode="last")
-            return
-        if "y撤回" in text:
-            await run_recall(ws, key, uid=uid, mode="all")
+        recall_cmd = match_recall_cmd(text)
+        if recall_cmd and recall_cmd[0] != "clear":
+            kind, num, _ = recall_cmd
+            await run_recall(ws, key, uid=uid,
+                             mode="all" if kind == "all" else "n", n=num)
             return
 
         # 阶段 1（持锁）：写入用户消息 → 判断是否触发压缩 → 取本轮请求快照
         async with get_mem_lock(key):
-            if "清空记忆" in text:
+            if recall_cmd and recall_cmd[0] == "clear":
                 clear_long_memory(key)   # 清 L0 + L1，并让在途压缩作废
                 if not await send_private_msg(ws, uid, clear_memory_reply_for(key)):
                     # 记忆确实已清空，只是回复没送出去；记日志以免用户以为没生效而反复发
-                    log.warning(f"清空记忆已执行，但确认回复未送达 uid={uid}")
+                    log.warning(f"%# 已执行，但确认回复未送达 uid={uid}")
                 return
 
             await append_memory(key, "user", combined_text,
@@ -3174,22 +3245,22 @@ async def handle_message(ws, data: dict):
         nickname_by_qq[uid] = nickname
         formatted_text = f"[{nickname}（QQ{uid}）]：{combined_text}"
 
-        if "清空记忆" in text:
-            clear_long_memory(key)
-            if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY_OUTER,
-                                        at_qq=uid if mentioned else None):
-                log.warning(f"清空记忆已执行，但确认回复未送达 gid={gid}")
-            return
-        if "c撤回" in text:
+        # 同私聊：指令统一识别，撤回走锁外（cmd_recall_* 自己取锁）
+        recall_cmd = match_recall_cmd(text)
+        if recall_cmd and recall_cmd[0] != "clear":
+            kind, num, _ = recall_cmd
             await run_recall(ws, key, gid=gid, at_qq=uid if mentioned else None,
-                             mode="last")
-            return
-        if "y撤回" in text:
-            await run_recall(ws, key, gid=gid, at_qq=uid if mentioned else None,
-                             mode="all")
+                             mode="all" if kind == "all" else "n", n=num)
             return
 
         async with get_mem_lock(key):
+            if recall_cmd and recall_cmd[0] == "clear":
+                clear_long_memory(key)
+                if not await send_group_msg(ws, gid, CLEAR_MEMORY_REPLY_OUTER,
+                                            at_qq=uid if mentioned else None):
+                    log.warning(f"%# 已执行，但确认回复未送达 gid={gid}")
+                return
+
             await append_memory(key, "user", formatted_text,
                                 data.get("message_id"), time.time())
             reply_msgs = build_reply_msgs(key, None)
@@ -3335,13 +3406,15 @@ async def debug_console():
     load_memory()
     load_long_memory()
     print("=== 调试模式 ===")
-    print("输入内容测试人设；输入 清空记忆 忘记上下文；输入 q 退出\n")
+    print("输入内容测试人设；输入 %# 忘记上下文；输入 q 退出\n")
     while True:
         text = input("你: ").strip()
         if text.lower() == "q":
             break
-        if "清空记忆" in text:
-            clear_long_memory("debug")
+        cmd = match_recall_cmd(text)
+        if cmd and cmd[0] == "clear":
+            async with get_mem_lock("debug"):
+                clear_long_memory("debug")
             print(f"{ROBOT_NAME}: {CLEAR_MEMORY_REPLY_OUTER}\n")
             continue
         async with get_mem_lock("debug"):
