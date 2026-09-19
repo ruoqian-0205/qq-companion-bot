@@ -1,4 +1,4 @@
-# QQ DeepSeek Bot
+# QQ Companion Bot
 
 一个**通过 NapCat 接入 QQ 消息**的机器人,由本地 Python 脚本驱动。
 
@@ -638,7 +638,7 @@ A: 这是官方行为:**思考模式下 `temperature`、`presence_penalty`、`fr
 ## 📁 目录结构
 
 ```
-qq-deepseek-bot/
+qq-companion-bot/
 ├── bot.py                    # 主程序(唯一入口)
 ├── config.example.json       # 配置示例(复制为 config.json)
 ├── config.json               # 实际配置(本地,已被 gitignore)
@@ -650,6 +650,7 @@ qq-deepseek-bot/
 ├── memory.json               # 对话窗口记忆(自动生成,已被 gitignore)
 ├── memory_long.json          # 长期记忆 L1:事实 + 心事 + 流水(自动生成,已被 gitignore)
 ├── napcat-autologin.bat      # 快速登录脚本(本机专属,已被 gitignore)
+├── face_probe.json           # 表情探针采集(本机专属,已被 gitignore)
 ├── requirements.txt          # Python 依赖
 └── README.md
 ```
