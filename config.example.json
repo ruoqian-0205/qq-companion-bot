@@ -3,8 +3,9 @@
     "qq": 1234567890,
     "name": "小深",
     "reply_probability": 0.7,
-    "fallback_reply": "喵……刚才网络开小差了，再说一次好不好？",
-    "clear_memory_reply": "喵~ 记忆已经清空啦，我们重新开始吧！"
+    "fallback_reply": "刚才没收到，能再说一次吗？",
+    "clear_memory_reply": "记忆已经清空啦，我们重新开始吧。",
+    "recall_window_seconds": 110
   },
 
   "model": {
@@ -41,6 +42,7 @@
     "self_bump": 0.5,
     "engage_peak": 0.95,
     "engage_up": 0.75,
+    "engage_up_followup": 0.3,
     "engage_keyword": 0.45,
     "engage_self_damp": 0.45,
     "engage_followup_seconds": 30,
@@ -57,6 +59,7 @@
 
   "memory": {
     "file": "memory.json",
+    "face_probe_file": "face_probe.json",
     "split_reply": {
       "enabled": true,
       "max": 10,
