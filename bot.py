@@ -2953,25 +2953,28 @@ async def drop_memory_by_mid(key: str, mid: str) -> int:
     return n
 
 
-async def cmd_recall_n(ws, key: str, n: int = 1) -> tuple[bool, str]:
-    """%n：撤回最近 n 条还撤得掉的机器人消息。返回 (是否成功, 给用户的话)。
+async def cmd_recall_n(ws, key: str, n: int = 1) -> tuple[bool, str, int, int]:
+    """%n：撤回最近 n 条还撤得掉的机器人消息。
 
-    与"撤全部"的区别只在取多少条：都从最近往回数，超窗的天然不在候选里。
+    返回 (是否成功, 给用户的话, 实际撤回条数, 请求撤回条数)。
+
+    为什么要带上"请求了几条"：`%5` 而窗口内只有 2 条时，撤掉那 2 条算成功，
+    但用户会以为自己发过 5 条、或以为指令没生效。调用方据此补一句提示
+    （告诉它实际只撤到几条），所以这个差额必须原样传出去。
 
     失败策略：**只要一条都没撤成就算失败**，原样报出原因（超窗 / 服务端拒绝）。
-    部分成功不报错 —— 撤掉的那几条用户看得见，为没撤掉的那条再挂一条提示，
-    反而盖住了"确实撤掉了"这个事实。
+    部分成功不算失败 —— 撤掉的那几条用户看得见，差额由上面那个提示负责说清。
     """
     if n <= 0:
-        return True, ""          # %0：合法指令但无事可做，静默
+        return True, "", 0, 0     # %0：合法指令但无事可做，静默
     async with get_mem_lock(key):
         cands = list_recallable(key)[:n]
         if not cands:
             oldest = _newest_bot_msg_age(key)
             if oldest is None:
-                return False, "没有找到我说过的话（可能已被撤回，或早已滚出记忆窗口）"
+                return False, "没有找到我说过的话（可能已被撤回，或早已滚出记忆窗口）", 0, n
             return False, (f"最后一条已经发出 {oldest:.0f} 秒，超出 QQ 的"
-                           f"可撤回时限（约 {RECALL_WINDOW} 秒），撤不回来了")
+                           f"可撤回时限（约 {RECALL_WINDOW} 秒），撤不回来了"), 0, n
 
     done = 0
     last_err = ""
@@ -2987,8 +2990,8 @@ async def cmd_recall_n(ws, key: str, n: int = 1) -> tuple[bool, str]:
             await drop_memory_by_mid(key, c["mid"])
     log.info(f"%{n}：{key} 尝试 {len(cands)} 条，成功 {done} 条")
     if done == 0:
-        return False, f"撤回失败：{last_err or '未能撤回任何一条'}"
-    return True, ""
+        return False, f"撤回失败：{last_err or '未能撤回任何一条'}", 0, n
+    return True, "", done, n
 
 
 async def cmd_recall_all(ws, key: str) -> tuple[int, str]:
@@ -3115,9 +3118,15 @@ async def run_recall(ws, key: str, uid: int | None = None, gid: int | None = Non
             log.info(f"%%：{key} 已撤回 {cnt} 条")
             return
     else:
-        ok, msg = await cmd_recall_n(ws, key, n)
+        ok, msg, done, wanted = await cmd_recall_n(ws, key, n)
         if ok:
             log.info(f"%{n}：{key} 撤回完成")
+            # 撤到了但没撤够（窗口内本来就没那么多条）也要说一声，
+            # 否则用户会以为自己发过 n 条、或以为指令没生效。
+            if done < wanted:
+                await _send_then_autodelete(
+                    ws, f"只有 {done} 条还撤得掉，已全部撤回", uid=uid, gid=gid,
+                    at_qq=at_qq)
             return
     # 走到这里说明失败了：告诉用户原因（顺带说明这是 QQ 的限制，不是指令没生效）
     await _send_then_autodelete(ws, msg, uid=uid, gid=gid, at_qq=at_qq)
