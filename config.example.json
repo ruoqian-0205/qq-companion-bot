@@ -3,8 +3,8 @@
     "qq": 1234567890,
     "name": "小深",
     "reply_probability": 0.7,
-    "fallback_reply": "刚才没收到，能再说一次吗？",
-    "clear_memory_reply": "记忆已经清空啦，我们重新开始吧。",
+    "fallback_reply": "喵……刚才网络开小差了，再说一次好不好？",
+    "clear_memory_reply": "喵~ 记忆已经清空啦，我们重新开始吧！",
     "recall_window_seconds": 110
   },
 
