@@ -1025,6 +1025,10 @@ def build_system_content(key: str) -> str:
         "这是系统标记，你**绝对不要**在自己的回复里写这种格式。"
         "看到表情就当作对方的一个语气/情绪来理解、自然回应即可，不必专门说「你发了个表情」。"
         "\n- 你可以发的QQ表情有：" + face_legend() + "。"
+        "想用表情就把它写在**句子里**，用花括号包住名字，例如「你说得对{狗头}」。"
+        "规则：**表情必须夹在文字中间**，不能单独成一条、也不要连续发两个；"
+        "不认识的名字会原样发出去，所以只用上面列出的那些。"
+        "表情是点缀，一句话最多一个，多数时候不用 —— 别每句都加。"
     )
     return base
 
@@ -2562,6 +2566,80 @@ def face_legend() -> str:
 
 
 
+# ---------- 表情发送 ----------
+# 模型输出的表情标记：{狗头}。与识别侧的 {表情:xxx} 是不同形态，不会撞。
+FACE_OUT_RE = re.compile(r"\{([^{}]{1,12})\}")
+# 名字 → id（由实测的 id 表反查，避免再维护第二份映射）
+FACE_ID_BY_NAME = {shown: fid for fid, (_official, shown) in QQ_FACES.items()}
+
+
+def _text_has_content(text: str) -> bool:
+    """这段文本除了空白/标点之外，还有没有真实内容。"""
+    return bool(re.sub(r"[\s，。！？、…~—·,.!?]+", "", text or ""))
+
+
+def build_message_payload(text: str, at_qq=None):
+    """把带 {表情名} 的文本转成 OneBot 消息（字符串或段数组）。
+
+    **只有"文本里确实有内容"时才解析表情**：否则 {狗头} 单独成条会被发成
+    一个纯表情消息，而用户明确要求"表情必须跟文字"。这条规则由代码强制，
+    不依赖模型自觉 —— 不满足就当普通文字发出去（对方看到的是 {狗头} 字样）。
+
+    返回可以直接塞进 send_* 的 message 字段。
+    """
+    segs = []
+    pos = 0
+    for m in FACE_OUT_RE.finditer(text or ""):
+        name = m.group(1).strip()
+        fid = FACE_ID_BY_NAME.get(name)
+        if fid is None:
+            continue         # 认不出的名字：不解析，留着当普通文字
+        before = text[pos:m.start()]
+        if before:
+            segs.append({"type": "text", "data": {"text": before}})
+        segs.append({"type": "face", "data": {"id": str(fid)}})
+        pos = m.end()
+    tail = (text or "")[pos:]
+    if tail:
+        segs.append({"type": "text", "data": {"text": tail}})
+
+    # 决定到底解不解析成表情段。三条都由代码强制，不指望模型自觉：
+    #   ① 段里得有表情
+    #   ② 段里得有真实文字（否则整条退回纯文本，{狗头} 原样显示）
+    #   ③ 第一个段不能是表情（"必须夹在文字中间"：段首那个不解析）
+    use_faces = any(s["type"] == "face" for s in segs)
+    if use_faces and not any(s["type"] == "text" and _text_has_content(s["data"]["text"])
+                             for s in segs):
+        log.info(f"忽略了单独的表情标记（要求表情必须跟文字）：{text[:40]!r}")
+        use_faces = False
+    # 段首那个表情退回当文字：要求"夹在文字中间"，它前面没有文字就不合规。
+    # 只退这一个，后面的合法标记照常解析（{狗头}行吧{大笑} 里的 {大笑} 仍然生效）。
+    if use_faces and segs and segs[0]["type"] == "face":
+        fid = segs[0]["data"]["id"]
+        back = next((n for n, i in FACE_ID_BY_NAME.items() if str(i) == str(fid)), "")
+        log.info(f"句首的表情按普通文字发（要求夹在文字中间）：{text[:40]!r}")
+        segs[0] = {"type": "text", "data": {"text": "{" + back + "}"}}
+
+    # 合并相邻 text 段：段首表情退回文字后会出现 [text][text] 这种，
+    # OneBot 允许但没必要，合起来更干净
+    merged = []
+    for seg in segs:
+        if (merged and seg["type"] == "text"
+                and merged[-1]["type"] == "text"):
+            merged[-1]["data"]["text"] += seg["data"]["text"]
+        else:
+            merged.append(seg)
+    segs = merged
+
+    # 只有这一处拼 @，所有返回路径都经过它 —— 否则某条分支会漏掉 at 段
+    if at_qq is None:
+        return segs if use_faces else text
+    head = {"type": "at", "data": {"qq": str(at_qq)}}
+    if use_faces:
+        return [head] + segs
+    return [head, {"type": "text", "data": {"text": " " + text}}]
+
+
 def extract_message(raw) -> tuple[str, list[dict]]:
     """
     从消息中提取纯文本和图片信息列表。
@@ -2632,7 +2710,7 @@ async def send_private_msg(ws, uid: int, text: str) -> str | None:
     所以调用方的 if 逻辑照旧可用。
     """
     data = await call_napcat(ws, "send_private_msg",
-                             {"user_id": uid, "message": text})
+                             {"user_id": uid, "message": build_message_payload(text)})
     mid = data.get("message_id") if data else None
     if mid:
         return str(mid)
@@ -2641,11 +2719,7 @@ async def send_private_msg(ws, uid: int, text: str) -> str | None:
 
 async def send_group_msg(ws, gid: int, text: str, at_qq: int | None = None) -> str | None:
     """发送群聊消息。成功返回 message_id，失败返回 None（判定同 send_private_msg）。"""
-    if at_qq is not None:
-        message = [{"type": "at", "data": {"qq": str(at_qq)}},
-                   {"type": "text", "data": {"text": " " + text}}]
-    else:
-        message = text
+    message = build_message_payload(text, at_qq=at_qq)
     data = await call_napcat(ws, "send_group_msg",
                              {"group_id": gid, "message": message})
     mid = data.get("message_id") if data else None
