@@ -2658,14 +2658,19 @@ async def handle_message(ws, data: dict):
         if GROUP_AT_ONLY and not mentioned:
             return
 
-        # 顺序：先按本条更新介入深度 → 用旧状态算概率 → 再记账。
-        # "在跟机器人说话"与"群友之间在聊"是两件事：前者抬 engage，后者抬热度，
-        # 分开记，否则对话会把自己的热度顶高、反过来把自己压没。
+        # 顺序有三个约束，缺一不可：
+        #   1) 快照必须在**改状态之前**取 —— p 用"此前积累的状态"算，日志里的
+        #      fast/slow/engage 也必须与算 p 时那份同源。否则日志会报出抬高之后的
+        #      engage，与真正的决策值对不上（实测出现过日志 0.75 / 实际 0.00 的偏差）。
+        #   2) note_group_engage 必须先于 note_group_message —— 它返回的
+        #      talking_to_me 决定这条算"对我说话"还是"群友闲聊"。
+        #   3) "在跟机器人说话"与"群友之间在聊"是两件事：前者抬 engage、后者抬热度，
+        #      分开记，否则对话会把自己的热度顶高、反过来把自己压没。
+        st = _heat_of(gid)
+        fast, slow = st["fast"], st["slow"]      # 决策时刻的快照，算 p 与日志共用
+        eng = _engage_of(gid)
         talking_to_me = note_group_engage(gid, mentioned, combined_text, nickname)
         prob = group_reply_probability(gid, mentioned, combined_text, nickname)
-        st = _heat_of(gid)
-        fast, slow = st["fast"], st["slow"]      # 快照，日志要用
-        eng = _engage_of(gid)
         if not talking_to_me:
             note_group_message(gid)
 
