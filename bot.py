@@ -2540,14 +2540,17 @@ def face_display_name(fid) -> str | None:
 
 
 def face_mark(fid) -> str:
-    """拼出进 L0 的完整表情标记：[名字] → {表情:名字}。
+    """拼出进 L0 的表情标记：名字 → {表情:名字}。
 
-    认不出 id 时不带内层括号 —— 写成 {表情:234}。
-    那个数字本身就是"这是个表情"的唯一信息（表里没有它），
-    再加一层"表情"字样只会变成 {表情:表情234}。
+    **认不出的 id 返回空串（不写进记忆）**。理由：模型看到 {表情:234}
+    只能理解为"一个我不认识的表情"，等于往上下文塞噪声 —— 既没提供信息，
+    又占 token，还可能干扰它对语气的判断。与其记个占位符，不如不记。
+
+    副作用（预期的）：若一条消息只含认不出的表情，它就没有可读内容，
+    整条不写记忆、也不触发回复 —— 跟"只发了张取不到的图片"同一种处理。
     """
     name = face_display_name(fid)
-    return f"{{表情:{name}}}" if name else f"{{表情:{fid}}}"
+    return f"{{表情:{name}}}" if name else ""
 
 
 def face_legend() -> str:
@@ -2581,8 +2584,9 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                 # clean_reply 会"以 [ 开头就删到 ]"（用来清时间戳/昵称前缀），
                 # 方括号会在有些位置被误清；花括号它根本不碰，省掉一层防御代码。
                 # 「表情:」前缀则用来和将来"模型输出 {狗头}"区分开。
-                fid = _seg_data(seg).get("id")
-                text += face_mark(fid)
+                mark = face_mark(_seg_data(seg).get("id"))
+                if mark:                     # 认不出的表情不写进记忆
+                    text += mark
             elif seg_type == "image":
                 data = seg.get("data", {})
                 url = data.get("url")
