@@ -449,11 +449,6 @@ _ROBOT_NAME_RE = re.compile(
 )
 
 
-# 表情标记：段首的 [表情:xxx]（extract_message 生成的就是这种形态）。
-# 只用于"跳过它、别当垃圾前缀清掉"，长度上限 20 是为了判据足够窄。
-_FACE_MARK_RE = re.compile(r"^\[表情:[^\]]{0,20}\]")
-
-
 def clean_reply(text: str) -> str:
     """
     清理 AI 回复开头可能误输出的时间戳、昵称前缀等垃圾信息。
@@ -463,21 +458,8 @@ def clean_reply(text: str) -> str:
       - {ROBOT_NAME}: / {ROBOT_NAME}：
       - 以及上面组合后残留的冒号
     """
-    # 表情标记是**内容**，不是模型误输出的前缀 —— 必须原样保留。
-    # 用 lookahead 跳过它、再继续清后面的前缀（比如后面真跟了昵称前缀）。
-    # 判据刻意很窄：只认 [表情:xxx]（长度上限 20），所以
-    # [2026-09-19 15:00 周六] 这种时间戳前缀不匹配、照旧被清。
     while True:
         stripped = text.lstrip()
-
-        # 0. 吃掉段首**所有**连续的表情标记（不清后面）。
-        #    只吃一个的话，[表情:A][表情:B]嗯 里第二个会在下一轮被当垃圾清掉。
-        #    用 for 而不是 while：标记数量有上限，不可能在这里空转。
-        for _ in range(8):
-            fm = _FACE_MARK_RE.match(stripped)
-            if not fm:
-                break
-            stripped = stripped[fm.end():]
 
         # 1. 清理开头的方括号前缀，如 [时间戳]、[{ROBOT_NAME}（QQ号）]
         if stripped.startswith('['):
@@ -1039,7 +1021,7 @@ def build_system_content(key: str) -> str:
         "\n- 你只能以你自己的角色发送一条或者多条消息。"
         "\n- 所有事件、信息只能根据已有信息判断，不得无中生有。"
         "\n- 你的每条回复都应该完全自然，像真人在QQ上聊天一样，不包含任何元信息或格式标记。"
-        "\n- 对话记录里的「[表情:xxx]」表示对方发了一个QQ表情（xxx 是它的名字）。"
+        "\n- 对话记录里的「{表情:xxx}」表示对方发了一个QQ表情（xxx 是它的名字）。"
         "这是系统标记，你**绝对不要**在自己的回复里写这种格式。"
         "看到表情就当作对方的一个语气/情绪来理解、自然回应即可，不必专门说「你发了个表情」。"
         "\n- 你可以发的QQ表情有：" + face_legend() + "。"
@@ -2579,12 +2561,12 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                 text += _at_text(seg.get("data", {}).get("qq"))
             elif seg_type == "face":
                 # 表情进文本：以前整段被忽略，于是"对方发了个狗头"对模型完全不存在。
-                # 现在转成 [表情:狗头] 这种可读形式，跟时间戳一样是"带标记的元信息"。
-                # 用「表情:」前缀而不是裸的 [狗头]，是为了不被 clean_reply 当成
-                # 时间戳前缀清掉 —— 只发表情不说话时整条就是 [表情:狗头]，
-                # 若写成 [狗头] 会被清成空串，那条消息就凭空消失了。
+                # 现在转成 {表情:狗头} 这种可读形式。用花括号而不是方括号，是因为
+                # clean_reply 会"以 [ 开头就删到 ]"（用来清时间戳/昵称前缀），
+                # 方括号会在有些位置被误清；花括号它根本不碰，省掉一层防御代码。
+                # 「表情:」前缀则用来和将来"模型输出 {狗头}"区分开。
                 fid = _seg_data(seg).get("id")
-                text += f"[表情:{face_display_name(fid)}]"
+                text += f"{{表情:{face_display_name(fid)}}}"
             elif seg_type == "image":
                 data = seg.get("data", {})
                 url = data.get("url")
