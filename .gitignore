@@ -17,6 +17,9 @@ memory_long.json
 # 哪天顺手 git add -A 就会把聊天隐私提交上去。
 memory.json.*
 memory_long.json.*
+
+# 表情探针采集文件（本机数据，含表情 id 对照）
+face_probe.json
 *.tmp
 
 # 快速登录脚本及其运行日志（含本机路径、机器人 QQ 号，属于本机专属配置）

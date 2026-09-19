@@ -2539,7 +2539,7 @@ def face_display_name(fid) -> str | None:
 # 外部查到的 face id 表不可靠（社区表里 14 是"微笑"不是"狗头"，"捂脸"压根不在表里），
 # 而**后端上报的 id 才是权威的**。这个探针把收到的表情 id 计数写到文件里，
 # 用来建立"这套 QQ 环境下真实可用"的对照表。只记录，不改任何行为。
-FACE_PROBE_FILE = r"D:\DeepSeek\_face_probe.json"
+FACE_PROBE_FILE = _MEMORY.get("face_probe_file", "face_probe.json")
 # 探针开关：表情表建好后默认关闭（要补采新表情时改 True）
 FACE_PROBE_ON = False
 
