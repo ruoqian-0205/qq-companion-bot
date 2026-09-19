@@ -2464,16 +2464,6 @@ def _at_text(qq) -> str:
     return f"@{nickname_by_qq.get(n, f'QQ{n}')}"
 
 
-def _seg_data(seg) -> dict:
-    """取出消息段的 data 字段，保证返回 dict。
-
-    为什么需要：`seg.get("data", {}).get(...)` 看着安全，其实不防类型错 ——
-    `.get(k, default)` 的 default 只在该键**缺失**时生效；若 data 存在但是
-    字符串（畸形上报），后面那次 `.get` 就会 AttributeError。
-    """
-    data = seg.get("data") if isinstance(seg, dict) else None
-    return data if isinstance(data, dict) else {}
-
 
 # ---------- QQ 内置表情 ----------
 # id → (QQ 官方标签, 给模型看的显示名)
@@ -2545,6 +2535,69 @@ def face_display_name(fid) -> str | None:
     return item[1] if item else None
 
 
+# ---------- 临时探针：表情 id 采集（建好对照表后整段删除）----------
+# 外部查到的 face id 表不可靠（社区表里 14 是"微笑"不是"狗头"，"捂脸"压根不在表里），
+# 而**后端上报的 id 才是权威的**。这个探针把收到的表情 id 计数写到文件里，
+# 用来建立"这套 QQ 环境下真实可用"的对照表。只记录，不改任何行为。
+FACE_PROBE_FILE = r"D:\DeepSeek\_face_probe.json"
+# 探针开关：表情表建好后默认关闭（要补采新表情时改 True）
+FACE_PROBE_ON = False
+
+
+def _seg_data(seg) -> dict:
+    """取出消息段的 data 字段，保证返回 dict。
+
+    为什么需要：`seg.get("data", {}).get(...)` 看着安全，其实不防类型错 ——
+    `.get(k, default)` 的 default 只在该键**缺失**时生效；若 data 存在但是
+    字符串（畸形上报），后面那次 `.get` 就会 AttributeError。
+    """
+    data = seg.get("data") if isinstance(seg, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+# 探针配名字用的正则：两种写法都收 —— {表情:狗头}（现行）与 {狗头}（旧写法）。
+# 必须与 FACE_MARK_RE 同构，否则 v4 统一写法之后，这里会捞出「表情:狗头」
+# 这种带前缀的残名字，写进对照表还得人工再剪一刀。
+FACE_NAME_RE = re.compile(r"\{(?:表情:)?([^{}]{1,12})\}")
+
+
+def note_face_pairs(pairs, naked_ids=()) -> None:
+    """记录「表情 id ↔ 名字」的配对，以及没配上名字的裸 id。
+
+    为什么按"配对"记：外部查来的 id 表不可靠（社区表里 14 是"微笑"不是"狗头"，
+    "捂脸"压根不在表里）。让用户一条消息里发「表情 {名字} 表情 {名字}」，
+    探针按出现顺序一一对应，一次就能采到一大批 —— 比一个表情一条消息快得多。
+
+    pairs      : [(id, 名字), ...] 按消息里的出现顺序
+    naked_ids  : 没配到名字的表情 id（仍要记，避免漏掉新号段）
+    任何异常都吞掉 —— 探针绝不能影响正常收发。
+    """
+    try:
+        data = {}
+        if os.path.exists(FACE_PROBE_FILE):
+            with open(FACE_PROBE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        now = get_beijing_time_str()
+        for fid, name in pairs:
+            key = str(fid)
+            rec = data.get(key) or {"count": 0}
+            rec["count"] = rec.get("count", 0) + 1
+            rec["name"] = name
+            rec["last"] = now
+            data[key] = rec
+        for fid in naked_ids:
+            key = str(fid)
+            rec = data.get(key) or {"count": 0}
+            rec["count"] = rec.get("count", 0) + 1
+            rec.setdefault("name", None)          # 没名字可配，留空待人工确认
+            rec["last"] = now
+            data[key] = rec
+        with open(FACE_PROBE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def face_mark(fid) -> str:
     """拼出进 L0 的表情标记：名字 → {表情:名字}。
 
@@ -2577,17 +2630,6 @@ def face_legend() -> str:
 FACE_MARK_RE = re.compile(r"\{(?:表情:)?([^{}]{1,12})\}")
 # 名字 → id（由实测的 id 表反查，避免再维护第二份映射）
 FACE_ID_BY_NAME = {shown: fid for fid, (_official, shown) in QQ_FACES.items()}
-
-
-def face_mark(fid) -> str:
-    """拼出表情标记：名字 → {表情:名字}。
-
-    **认不出的 id 返回空串（整个不写字）**。理由：模型看到 {表情:234}
-    只能理解为"一个我不认识的表情"，等于往上下文塞噪声 —— 既没提供信息，
-    又占 token，还可能干扰它对语气的判断。与其记个占位符，不如不记。
-    """
-    name = face_display_name(fid)
-    return f"{{表情:{name}}}" if name else ""
 
 
 def _face_name_of(match) -> str | None:
@@ -2685,11 +2727,18 @@ def extract_message(raw) -> tuple[str, list[dict]]:
     """
     text = ""
     images = []
+    face_ids: list = []          # 探针用：本条消息里出现的表情 id（按顺序）
+    # 探针用：**用户手写的**文本（只累积 text 段，不含代码生成的表情标记）。
+    # 不能拿最终的 text 去配名字 —— 表内表情会被代码转成 {表情:名字} 混进来，
+    # 与用户手写的名字串在一起，顺序配对就整体错位了。
+    probe_text = ""
     if isinstance(raw, list):
         for seg in raw:
             seg_type = seg.get("type")
             if seg_type == "text":
-                text += seg.get("data", {}).get("text", "")
+                seg_text = seg.get("data", {}).get("text", "")
+                text += seg_text
+                probe_text += seg_text
             elif seg_type == "at":
                 # at 段原先被直接丢弃，于是"谁 @ 了谁"完全进不了记忆 ——
                 # 模型因此分不清群友之间的互动和对自己说话，看到 @ 就以为在叫它。
@@ -2700,9 +2749,14 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                 # clean_reply 会"以 [ 开头就删到 ]"（用来清时间戳/昵称前缀），
                 # 方括号会在有些位置被误清；花括号它根本不碰，省掉一层防御代码。
                 # 「表情:」前缀则用来和将来"模型输出 {狗头}"区分开。
-                mark = face_mark(_seg_data(seg).get("id"))
+                # fid 必须先取出来：face_mark 只回一个字符串，
+                # 探针要的是原始 id（尤其是**认不出**的那些，那才是要补采的）。
+                fid = _seg_data(seg).get("id")
+                mark = face_mark(fid)
                 if mark:                     # 认不出的表情不写进记忆
                     text += mark
+                if FACE_PROBE_ON:
+                    face_ids.append(fid)
             elif seg_type == "image":
                 data = seg.get("data", {})
                 url = data.get("url")
@@ -2719,6 +2773,12 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                     log.warning("收到图片但无 URL：%s", data)
     else:
         text = str(raw)
+    # 探针收尾：把攒下的表情 id 与**用户手写文本**里的名字按出现顺序配对后记录
+    if face_ids and FACE_PROBE_ON:
+        names = FACE_NAME_RE.findall(probe_text)
+        pairs = [(fid, names[i].strip()) for i, fid in enumerate(face_ids[:len(names)])]
+        naked = face_ids[len(names):]
+        note_face_pairs(pairs, naked)
     return text, images
 
 def is_mentioned(raw, self_id: int) -> bool:
@@ -3347,6 +3407,10 @@ async def main():
              + (f"；里人格 {_inner}，适用 {sorted(PERSONA_INNER_ACCOUNTS)}"
                 if PERSONA_INNER else "；里人格未启用，全部账号使用表人格"))
     log.info(f"正在连接 NapCat: {WS_URL}")
+
+    if FACE_PROBE_ON:
+        log.warning("表情探针已启用：收到表情会把 id 记到 "
+                    f"{FACE_PROBE_FILE}")
     if AUTO_RELOGIN:
         log.info(f"掉线自愈已启用：每 {HEALTH_CHECK_INTERVAL} 秒巡检，"
                  f"离线时自动快速登录（每小时最多 {RELOGIN_MAX_PER_HOUR} 次）")
