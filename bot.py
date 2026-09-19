@@ -2525,13 +2525,29 @@ QQ_FACES = {
 }
 
 
-def face_display_name(fid) -> str:
-    """把表情 id 转成给模型的显示名。认不出就诚实降级，不猜。"""
+def face_display_name(fid) -> str | None:
+    """查表情的显示名。认不出返回 None —— **不要在这里造"表情234"这种名字**。
+
+    "表情"两个字是标记的**前缀**（由 face_mark 拼），不是一个名字。
+    早期版本在这里返回 "表情234"，调用方又套一层 {表情:...}，
+    结果写成 {表情:表情234} —— 又长又别扭，还污染上下文。
+    """
     try:
         item = QQ_FACES.get(int(fid))
     except (TypeError, ValueError):
-        return f"表情{fid}"
-    return item[1] if item else f"表情{fid}"
+        return None
+    return item[1] if item else None
+
+
+def face_mark(fid) -> str:
+    """拼出进 L0 的完整表情标记：[名字] → {表情:名字}。
+
+    认不出 id 时不带内层括号 —— 写成 {表情:234}。
+    那个数字本身就是"这是个表情"的唯一信息（表里没有它），
+    再加一层"表情"字样只会变成 {表情:表情234}。
+    """
+    name = face_display_name(fid)
+    return f"{{表情:{name}}}" if name else f"{{表情:{fid}}}"
 
 
 def face_legend() -> str:
@@ -2566,7 +2582,7 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                 # 方括号会在有些位置被误清；花括号它根本不碰，省掉一层防御代码。
                 # 「表情:」前缀则用来和将来"模型输出 {狗头}"区分开。
                 fid = _seg_data(seg).get("id")
-                text += f"{{表情:{face_display_name(fid)}}}"
+                text += face_mark(fid)
             elif seg_type == "image":
                 data = seg.get("data", {})
                 url = data.get("url")
