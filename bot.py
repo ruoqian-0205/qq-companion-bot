@@ -2674,10 +2674,16 @@ async def handle_message(ws, data: dict):
         if not talking_to_me:
             note_group_message(gid)
 
-        if random.random() > prob:
-            log.info(f"群 {gid} 跳过（p={prob:.3f}｜冷清度={(1 - fast) * (1 - slow):.2f}"
-                     f"｜fast={fast:.2f} slow={slow:.2f}｜engage={eng:.2f}"
-                     f"｜{'对我说话' if talking_to_me else '群友闲聊'}）")
+        # 无论回不回都打同一组字段（同样取自决策时刻的快照）：这样日志里既有
+        # "它为什么没理我"，也有"它是在什么状态下理我的"。原实现只有跳过路径可见，
+        # 调参时完全看不到回复那一侧的状况。
+        # roll 只取一次 —— 写两次 random.random() 会让日志说的和实际做的对不上。
+        roll = random.random()
+        log.info(f"群 {gid} {'跳过' if roll > prob else '回复'}"
+                 f"（p={prob:.3f}｜冷清度={(1 - fast) * (1 - slow):.2f}"
+                 f"｜fast={fast:.2f} slow={slow:.2f}｜engage={eng:.2f}"
+                 f"｜{'对我说话' if talking_to_me else '群友闲聊'}）")
+        if roll > prob:
             return
 
         # 生成前在线检查（同私聊）
