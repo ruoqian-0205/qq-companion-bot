@@ -45,7 +45,7 @@
     "engage_up_followup": 0.3,
     "engage_keyword": 0.45,
     "engage_self_damp": 0.45,
-    "engage_followup_seconds": 30,
+    "engage_followup_seconds": 60,
     "engage_half_life_seconds": 90
   },
 
