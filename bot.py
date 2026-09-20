@@ -1561,7 +1561,7 @@ async def update_persona(key: str, old_persona: str, facts: list, recent: dict,
         f"【你们最近说过的话】\n{dialog_tail}\n\n"
         f"【你上次写下的心事】\n{old_persona or '（还没有）'}\n\n"
         f"重写一份心事，{max(100, LM_PERSONA_MAX_CHARS // 2)}~{LM_PERSONA_MAX_CHARS} 字。\n"
-        "写你在相处里形成的偏好、你注意到的自己的变化、你没说出口的心事、你的情愫、你隐秘的欲望。\n"
+        "写你们现在的关系进展、你在相处里形成的偏好、你注意到的自己的变化、你没说出口的心事、你的情愫、你隐秘的欲望。\n"
         "不要复述他说过什么——写你因此变成了什么样。\n"
         "不要照搬照抄上一次的心事。\n"
         "直接写正文，不要标题、不要分点。"
