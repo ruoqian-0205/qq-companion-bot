@@ -14,6 +14,7 @@ import os
 from dotenv import load_dotenv
 import uuid
 import base64
+import ssl
 import shutil
 import socket
 import atexit
@@ -2302,46 +2303,384 @@ async def relogin_watchdog(ws):
         else:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
-# ---------- 图片获取(读 NapCat 本地缓存,绕开腾讯防盗链) ----------
-async def get_image_base64(ws, file_name: str) -> str | None:
+# ---------- 图片获取（本地缓存优先，取不到就下载那个 URL） ----------
+# 判定"这是不是表情"要分两层，缺一不可：
+#
+# 1. `sub_type`：2 / 7 是 QQ 明确上报的表情包类型。
+#    注意**不能只靠它** —— 实测商城表情上报的是 `sub_type=0`，与普通图片
+#    完全同值（虽然 OneBot 规范里 0 写作"正常图片"）。
+# 2. URL 特征：资源型表情（商城/收藏）的地址固定在 club/item/parcel 下。
+#    这是目前唯一能把它和普通图片区分开的信号。
+QQ_STICKER_SUB_TYPES = (2, 7)
+# 资源型表情（商城/收藏）的 URL 特征 —— 实测样本：
+#   https://gxh.vip.qq.com/club/item/parcel/item/ab/<hash>/raw300.gif
+# 这是**判断"是不是表情"的唯一可靠信号**：这类表情的 sub_type 实测是 0，
+# 与普通图片同值，光看 sub_type 认不出来。
+STICKER_URL_MARKERS = ("/club/item/parcel",)
+
+
+def image_seg_kind(sub_type, url: str = "") -> str:
+    """判断图片段的种类，返回 "sticker"（表情）或 "image"（普通图片）。
+
+    抽成函数是为了让"提示词选择"和"消息里的类型标签"用**同一套判据** ——
+    否则很容易出现一边当表情、一边当图片的自相矛盾。
     """
-    通过 NapCat 获取图片缓存内容并转为 base64 data URL。
-    腾讯图片链接带防盗链和时效,NapCat 本地必然已有缓存,读取缓存即可绕过。
+    try:
+        if int(sub_type) in QQ_STICKER_SUB_TYPES:
+            return "sticker"
+    except (TypeError, ValueError):
+        pass
+    u = (url or "").lower()
+    return "sticker" if any(m in u for m in STICKER_URL_MARKERS) else "image"
+
+
+def _api_verdict(data) -> str:
+    """把 NapCat 的返回压成一行，用于诊断「为什么拿不到这张图」。
+
+    取图失败时最需要知道的恰恰是**后端说了什么**：是明确拒绝（status/retcode）、
+    返回了空字段，还是压根没回应。以前这些信息被直接丢掉，日志里只剩一句
+    「无法获取图片内容」，只能靠猜 —— 商城表情那次就是这么卡住的。
     """
-    # 方案1:get_file(扩展 API,直接返回 base64 内容)
+    if data is None:
+        return "无返回（超时或未收到回执）"
+    if not isinstance(data, dict):
+        return "非预期返回类型 %s" % type(data).__name__
+    if not data:
+        return "空对象 {}"
+    keys = ("status", "retcode", "message", "wording", "file", "url", "base64")
+    parts = []
+    for k in keys:
+        if k not in data:
+            continue
+        v = data[k]
+        if k == "base64":
+            # 只报长度，不把整段 base64 刷进日志
+            parts.append("base64=%s" % ("<%d 字符>" % len(v) if v else "<空>"))
+        else:
+            parts.append("%s=%r" % (k, v))
+    extra = [k for k in data if k not in keys]
+    if extra:
+        parts.append("其他字段=%s" % extra)
+    return " ".join(parts) or repr(data)[:200]
+
+
+def _sniff_image_mime(raw: bytes, hint: str = "") -> str:
+    """按文件头判断图片类型，判不出再看扩展名。
+
+    比单纯 endswith() 可靠：QQ 缓存里可能是 .webp/.gif 或无扩展名，
+    只按后缀会把它们一律标成 image/jpeg。
+    """
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    low = (hint or "").lower().split("?")[0]
+    for ext, mime in ((".png", "image/png"), (".gif", "image/gif"),
+                      (".webp", "image/webp"), (".bmp", "image/bmp")):
+        if low.endswith(ext):
+            return mime
+    return "image/jpeg"
+
+
+def _http_get_once(url: str, timeout: float, force_addr=None, read_timeout: float = 0):
+    """发一次 GET，返回 (status, body, 响应头文本)。
+
+    `timeout` 同时用于连接与首次读取，`read_timeout`（可选，更大）在**连接成功
+    之后**替换它 —— 连接要快失败以淘汰坏地址，而正文读取需要更大余量。
+
+    `force_addr` 为空时用**域名**连接 —— 这一点很重要：早先为了控制解析次数改成
+    连 IP，结果 HTTPS 直接 `SSLCertVerificationError: IP address mismatch`
+    （SNI 与证书校验都对不上）。所以默认必须是域名；
+    force_addr 只在域名连不通时作为回退，那种情况下由调用方决定是否放宽校验。
+    """
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    port = u.port or (443 if u.scheme == "https" else 80)
+    if force_addr:
+        host, family = force_addr[0], (socket.AF_INET6 if ":" in force_addr[0]
+                                       else socket.AF_INET)
+    else:
+        # 用域名连接：先只做地址解析来拿到正确的协议族，真正的连接仍交给
+        # connect(域名) —— 这样 SNI 与证书校验都按域名走。
+        host, family = u.hostname, socket.AF_UNSPEC
+        for fam, _st, _pr, _ca, _sa in socket.getaddrinfo(
+                u.hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            host, family = u.hostname, fam
+            break
+
+    raw_sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        raw_sock.settimeout(timeout)
+        raw_sock.connect(force_addr if force_addr else (host, port))
+        if u.scheme == "https":
+            ctx = ssl.create_default_context()
+            if force_addr:
+                # 回退到 IP 时证书必然与 IP 对不上，只能放宽校验。连接本身仍是
+                # TLS 加密的，而这里下载的是一张公开的表情图。
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(raw_sock,
+                                   server_hostname=None if force_addr else u.hostname)
+        else:
+            sock = raw_sock
+        # 连上了就把超时放宽：连接要用短超时快速淘汰坏地址，而接收正文
+        # 需要的余量更大（实测 1.53MB 照片 0.57~1.07 秒，10 秒已有十倍余量）。
+        if read_timeout and read_timeout > timeout:
+            sock.settimeout(read_timeout)
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+        req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+               "Accept: image/*,*/*\r\nConnection: close\r\n\r\n" % (path, u.netloc))
+        sock.sendall(req.encode("ascii", "ignore"))
+
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise IOError("连接在响应头读完前关闭")
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        head_text = head.decode("latin-1")
+        m = re.match(r"HTTP/\d\.\d\s+(\d+)", head_text)
+        status = int(m.group(1)) if m else 0
+        if status >= 400:
+            return status, b"", head_text
+        chunked = "transfer-encoding: chunked" in head_text.lower()
+        # 有 Content-Length 就一定按它判断读完 —— 这是这里最关键的一条：
+        # QQ 的图片 CDN **发完数据也不关连接**，只按"等 EOF"读的话，数据早已
+        # 收全（实测 1530141 字节收满、与 Content-Length 一致），却还要一直等到
+        # socket 超时才退出。每次下载白等一整个超时，看起来就像"读不完"。
+        clen = 0
+        for line in head_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    clen = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    clen = 0
+                break
+
+        body = rest
+        if chunked:
+            data = b""
+            while True:
+                while b"\r\n" not in body:
+                    more = sock.recv(65536)
+                    if not more:
+                        # 连接在块长度行读到一半就断了：数据不完整，
+                        # 不能当成功返回（模型会照着半张图描述）
+                        raise IOError("chunked 响应提前结束（已读 %d 字节）" % len(data))
+                    body += more
+                line, _, body = body.partition(b"\r\n")
+                size = int(line.split(b";")[0] or b"0", 16)
+                if size == 0:
+                    return status, data, head_text      # 终止块 → 读完整了
+                while len(body) < size + 2:
+                    more = sock.recv(65536)
+                    if not more:
+                        raise IOError("chunked 数据块截断（已读 %d 字节）" % len(data))
+                    body += more
+                data += body[:size]
+                body = body[size + 2:]
+        while True:
+            if clen and len(body) >= clen:
+                return status, body[:clen], head_text
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        return status, body, head_text
+    finally:
+        try:
+            raw_sock.close()
+        except Exception:
+            pass
+
+
+def _download_image(url, timeout: float = 10.0, read_timeout: float = 0) -> bytes | None:
+    """同步下载图片字节（调用方用线程 + 超时包住）。
+
+    这里的参数要分清两件事，它们的最优值是相反的：
+      - **连接**要快失败：地址不通就立刻换下一个（实测这台机器上很多 IPv6
+        地址完全不可达，等它们等于白等）。
+      - **传输**要有余量：实测本机到腾讯 CDN 很快（1.53MB 照片 0.57~1.07 秒），
+        给 10 秒已经有约十倍余量，不必给几十秒。
+
+    另外两条约束也来自实测：
+    1. 不要用 `urlopen` —— 它给每个候选地址各算一次 timeout（实测 5 秒变 15.75 秒）。
+    2. 连接必须用域名或至少保留域名语义 —— 直接连 IP 会触发
+       `SSLCertVerificationError: IP address mismatch`（回退到 IP 时才放宽校验）。
+    3. IPv4 优先：这台机器上 IPv6 到腾讯 CDN 完全不通。
+    """
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ValueError("不支持的 URL: %s" % url[:80])
+    if read_timeout <= 0:
+        read_timeout = timeout
+
+    deadline = time.time() + timeout
+    last_err = None
+    addrs = []
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80),
+                                  socket.AF_UNSPEC, socket.SOCK_STREAM)
+        seen = set()
+        for fam, _st, _pr, _ca, sa in infos:
+            if sa[0] not in seen:
+                seen.add(sa[0])
+                addrs.append((fam, sa))
+        # IPv4 排前面：IPv6 在这类 CDN 上实测不可达，先试它会白等一整轮
+        addrs.sort(key=lambda x: 0 if x[0] == socket.AF_INET else 1)
+    except Exception as e:      # noqa: BLE001
+        last_err = e
+
+    # 第一轮：逐个 IP（连接快失败；连上后按 read_timeout 读，不再受连接预算限制）
+    for _fam, sa in addrs:
+        remain = deadline - time.time()
+        if remain <= 0.3:
+            break
+        try:
+            status, body, _hd = _http_get_once(url, min(3.0, remain), force_addr=sa,
+                                               read_timeout=read_timeout)
+            if status >= 400:
+                last_err = IOError("HTTP %d" % status)
+                continue
+            return body
+        except Exception as e:      # noqa: BLE001
+            last_err = e
+
+    # 第二轮：再试纯域名连接（证书校验完整；个别 CDN 只认 SNI 时走这条）
+    remain = deadline - time.time()
+    if remain > 0.3:
+        try:
+            status, body, _hd = _http_get_once(url, min(4.0, remain),
+                                               read_timeout=read_timeout)
+            if status < 400:
+                return body
+            last_err = IOError("HTTP %d" % status)
+        except Exception as e:      # noqa: BLE001
+            last_err = last_err or e
+
+    raise last_err if last_err else IOError("所有地址都失败")
+
+
+async def _download_image_bytes(url: str, timeout: float = 8.0) -> tuple[bytes | None, str]:
+    """下载图片，返回 (字节 或 None, 诊断信息)。**主流程绝不被挂住。**
+
+    超时分两种，别混：
+      - `timeout` 是**连接预算**：用来逐个淘汰坏地址（要短）。
+      - `read_timeout` 是**单次读取超时**：只用来兜住"连上了但不吐数据"的地址。
+
+    读取超时给 10 秒（不是几十秒）：实测本机到腾讯 CDN 相当快 ——
+    1.53MB 照片 0.57~1.07 秒、199KB 0.31 秒、31KB 0.21 秒（多次复测），
+    10 秒已有约 10 倍余量。**曾一度写成 35 秒，那是基于错误测量的结论**：
+    当时数据其实早已收满（Content-Length 判断缺失，见 _http_get_once），
+    白等的时间被误当成了传输时间。
+    """
+    read_timeout = 10.0
+    try:
+        raw = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                None, _download_image, url, timeout, read_timeout),
+            timeout=timeout + read_timeout + 4)
+    except Exception as e:
+        return None, "下载失败 %s: %s" % (type(e).__name__, e)
+    if not raw:
+        return None, "下载到 0 字节"
+    return raw, "下载成功 <%d 字节>" % len(raw)
+
+
+async def get_image_base64(ws, file_name: str, url: str = ""):
+    """取图，返回 (base64 data URL 或 None, 诊断信息)。三条路依次尝试：
+
+    1. `get_file`  —— NapCat 扩展 API，可能直接回 base64
+    2. `get_image` —— 标准 API，可能回本地缓存路径，**也可能回下载 URL**
+    3. 直接下载 URL —— 消息段自带的，或第 2 步返回的
+
+    第 3 条是必需的：商城/收藏表情（file 形如 `ab-<hash>.gif`）的 `file` 是
+    **资源 ID 而非 QQ 落盘的图片文件名**，NapCat 对它的两条查询都返回空对象
+    （实测），本地无路可走 —— 但这类表情的消息段自带可访问的 url。
+
+    这里**刻意不自作聪明跳过前两条**：早先按"file 名含连字符"跳过，理由是
+    "省两次注定为空的往返"，但实测那两次调用只是**毫秒级返回空对象**，
+    省不到什么；反而把 NapCat 的真实返回换成了固定文案，诊断信息全丢 ——
+    而"看不到后端说了什么"正是当初要解决的问题。
+    """
+    # 方案1:get_file(扩展 API,可能直接返回 base64 内容)
+    verdict_a = "未执行"
     try:
         info = await call_napcat(ws, "get_file", {"file_id": file_name})
+        verdict_a = _api_verdict(info)
         if info and info.get("base64"):
-            fn = info.get("file") or ""
-            mime = "image/png" if fn.lower().endswith(".png") else "image/jpeg"
-            return f"data:{mime};base64,{info['base64']}"
+            # b64decode 顺手拿到字节，MIME 按**文件头**判（原来只看 .png 后缀，
+            # 会把 webp/gif 一并当成 jpeg）
+            raw = base64.b64decode(info["base64"])
+            mime = _sniff_image_mime(raw, info.get("file") or "")
+            return f"data:{mime};base64,{info['base64']}", verdict_a
     except Exception as e:
+        verdict_a = "异常 %s: %s" % (type(e).__name__, e)
         log.error(f"get_file 失败: {e}")
 
-    # 方案2:get_image(标准 API,拿本地缓存路径再读文件)
+    # 方案2:get_image(标准 API，可能回本地缓存路径，也可能回下载 URL)
+    verdict_b = "未执行"
+    fallback_url = ""
     try:
         info = await call_napcat(ws, "get_image", {"file": file_name})
+        verdict_b = _api_verdict(info)
         if info:
             path = info.get("file") or ""
-            if path and os.path.exists(path):
+            if path.startswith(("http://", "https://")):
+                # NapCat 对普通图片回的 `file` 就是下载 URL（不是本地路径）。
+                # 不能拿它去 os.path.exists 检查 —— 那必然报"不存在"，
+                # 于是每张图都刷一条无意义的告警。留作方案3 的备选地址。
+                fallback_url = path
+                verdict_b += "（是下载 URL，转方案3）"
+            elif path and os.path.exists(path):
                 with open(path, "rb") as f:
                     raw = f.read()
-                mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
-                return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
-            log.warning(f"get_image 返回的路径不存在: {path}")
+                mime = _sniff_image_mime(raw, path)
+                return f"data:{mime};base64,{base64.b64encode(raw).decode()}", verdict_b
+            elif path:
+                log.warning(f"get_image 返回的本地路径不存在: {path}")
     except Exception as e:
+        verdict_b = "异常 %s: %s" % (type(e).__name__, e)
         log.error(f"get_image 失败: {e}")
 
-    return None
+    # 方案3:直接下载。消息段的 url 优先，其次用第 2 步返回的那个 ——
+    # 两者实测通常是同一个地址，但只认其中一个会在另一个缺失时白白失败。
+    target = url or fallback_url
+    verdict_c = "无 url" if not target else "未执行"
+    if target:
+        if not url:
+            verdict_c = "用 get_image 返回的 url"
+        _t0 = time.time()
+        raw, verdict_c = await _download_image_bytes(target)
+        if raw:
+            mime = _sniff_image_mime(raw, target)
+            # 成功也记一条 INFO：这条图片是靠下载拿到的，以及花了多久 ——
+            # 想知道"图片是不是慢"时，这是唯一的观测点。
+            log.info(f"图片已下载: {len(raw)} 字节 {mime} "
+                     f"耗时 {time.time() - _t0:.2f}s")
+            return (f"data:{mime};base64,{base64.b64encode(raw).decode()}",
+                    "download[%s]" % verdict_c)
+
+    return None, "get_file[%s] get_image[%s] download[%s]" % (verdict_a, verdict_b, verdict_c)
 
 # ---------- 视觉模型调用（图片转文字） ----------
 async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
+    """识别图片或表情包，返回描述文字。
+
+    提示词按**表情/普通图片**分两种：表情要看懂"梗"和情绪，普通图片要描述内容。
+    判据取自 img["kind"]（在 extract_message 里就定好了，见 image_seg_kind）——
+    不要在这里重新判一遍 sub_type，那正是"商城表情被当普通图片"的成因。
     """
-    根据 sub_type 选择提示词，识别图片或表情包。
-    img: {"url":..., "file":..., "sub_type":...}
-    sub_type: 0=普通图片, 2/7=表情包（QQ常见）
-    """
-    if sub_type in (2, 7):
+    kind = img.get("kind") or image_seg_kind(sub_type, img.get("url") or "")
+    if kind == "sticker":
         prompt = (
             "请识别这个QQ表情包，用中文描述其画面内容、提取图中文字，"
             "并简要说明这个表情包可能表达的情绪或梗的含义。直接描述，不要解释过程。"
@@ -2349,15 +2688,23 @@ async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
     else:
         prompt = "请用中文描述这张图片的内容及必要的文字原文消息内容。直接描述，不要解释过程。"
 
-    # 优先取 NapCat 本地缓存(绕开腾讯防盗链),拿不到就返回失败
+    # 三条路依次尝试：get_file（可能给 base64）→ get_image（可能给本地路径或
+    # 下载 URL）→ 直接下载。细节见 get_image_base64。
     file_name = img.get("file") or ""
     if not file_name:
-        log.warning(f"图片无缓存文件名,跳过识别: {str(img.get('url'))[:60]}...")
+        log.warning(f"图片无缓存文件名,跳过识别: url={img.get('url')}")
         return ""
 
-    image_data = await get_image_base64(ws, file_name)
+    image_data, verdict = await get_image_base64(ws, file_name, img.get("url") or "")
     if not image_data:
-        log.warning(f"无法获取图片内容,跳过识别: file={file_name} url={str(img.get('url'))[:60]}...")
+        # 把两条路的原始返回一并记下：失败原因必须可见，否则只能靠猜。
+        # url 记**完整**的：它是消息段里自带的权威地址，也是唯一可能绕开
+        # "本地缓存查不到"的出路；截断过的 URL 没法拿去复现或验证。
+        # 多行前缀与主行对齐，便于在日志里成组阅读。
+        log.warning("无法获取图片内容,跳过识别: file=%s\n"
+                    "      url=%s\n"
+                    "      %s",
+                    file_name, img.get("url"), verdict)
         return ""
 
     try:
@@ -2765,7 +3112,10 @@ def extract_message(raw) -> tuple[str, list[dict]]:
                         sub_type = 0
                     images.append({"url": url,
                                    "file": data.get("file", ""),
-                                   "sub_type": sub_type})
+                                   "sub_type": sub_type,
+                                   # 这里就把种类定下来，下游不再各自判断，
+                                   # 避免"提示词当表情、标签当图片"这种不一致
+                                   "kind": image_seg_kind(sub_type, url)})
                 else:
                     log.warning("收到图片但无 URL：%s", data)
     else:
@@ -3159,8 +3509,12 @@ async def handle_message(ws, data: dict):
         descriptions = []
         for idx, img in enumerate(images, start=1):
             sub_type = img["sub_type"]
-            is_sticker = sub_type in (2, 7)
-            type_tag = "【表情包】" if is_sticker else "【图片】"
+            # 种类已在 extract_message 里定好（sub_type 不足以区分资源型表情）
+            kind = img.get("kind") or image_seg_kind(sub_type, img.get("url") or "")
+            type_tag = "【表情包】" if kind == "sticker" else "【图片】"
+            # 记下判据：sub_type 与最终判定，遇到判错能一眼看出真实值再调整
+            log.info(f"图片 {idx}/{total_images}: sub_type={sub_type} "
+                     f"kind={kind} → {type_tag}")
 
             if idx <= MAX_IMAGES_PER_MESSAGE:
                 desc = await image_to_text(ws, img, sub_type)
