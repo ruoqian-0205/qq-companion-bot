@@ -640,12 +640,21 @@ def _clean_persona(raw) -> str:
     """清洗 persona（"你心里的事"）。它是一段文本，不是条目列表。
 
     与 facts 的根本区别：facts 只能增删条目，persona 每次压缩时整体重写——
-    人格要能"变成另一个人"，而不是靠条目堆叠。所以这里只做空白规整与长度截断，
-    内容判断完全留给模型。
+    人格要能"变成另一个人"，而不是靠条目堆叠。所以这里只做空白规整，
+    内容与长度判断完全留给模型。
+
+    **刻意不截断**：`persona_max_chars` 是给模型的"建议字数"（写在 prompt 里），
+    不是硬上限。早先这里会 `text[:400]` 直接切掉超出部分，后果是：
+      - 心事可能在句子中间断掉，读起来莫名其妙
+      - 而日志里什么都看不到，根本不知道被切了
+    超限只记一条 warning —— 让偏差可见，交给提示词去约束模型；
+    真要收紧就调 persona_max_chars，而不是在这里偷偷剪内容。
     """
     text = str(raw or "").replace("\r\n", "\n").strip()
-    if len(text) > LM_PERSONA_MAX_CHARS:
-        text = text[:LM_PERSONA_MAX_CHARS].rstrip()
+    n = len(text)
+    if n > LM_PERSONA_MAX_CHARS:
+        log.warning(f"心事（persona）{n} 字，超过建议上限 {LM_PERSONA_MAX_CHARS} 字"
+                    f"（不截断，完整保留；持续超限可调 long_memory.persona_max_chars）")
     return text
 
 
@@ -3833,7 +3842,8 @@ async def main():
         log.info(f"长期记忆已启用（仅私聊）：L0 上限 {LM_L0_MAX} 条，每次压缩 {LM_COMPRESS_COUNT} 条，"
                  f"L1 上限 {LM_L1_MAX_FACTS} 条（{_format_type_quota()}）；"
                  f"近期流水保留最近 {LM_RECENT_DAYS} 个聊过的日子 / 最多 {LM_RECENT_MAX_ITEMS} 条；"
-                 f"心事（persona）上限 {LM_PERSONA_MAX_CHARS} 字；存储于 {LM_FILE}")
+                 f"心事（persona）建议 {LM_PERSONA_MAX_CHARS} 字（超限只告警、不截断）；"
+                 f"存储于 {LM_FILE}")
         log.info(f"群聊 L0 与私聊共用同一窗口参数（上限 {LM_L0_MAX} 条 / 每次 {LM_COMPRESS_COUNT} 条），"
                  f"但群聊只截断丢弃，不压缩、不写入 L1")
     log.info(f"人格：表人格 {_outer}"
