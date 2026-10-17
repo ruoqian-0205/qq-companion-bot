@@ -2725,7 +2725,8 @@ async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
                     {"type": "image_url", "image_url": {"url": image_data}}
                 ]}
             ],
-            max_tokens=500
+            max_tokens=500,
+            extra_body={"enable_thinking": False}
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
