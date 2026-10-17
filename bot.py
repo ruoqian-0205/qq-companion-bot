@@ -2691,11 +2691,11 @@ async def image_to_text(ws, img: dict, sub_type: int = 0) -> str:
     kind = img.get("kind") or image_seg_kind(sub_type, img.get("url") or "")
     if kind == "sticker":
         prompt = (
-            "请识别这个QQ表情包，用中文描述其画面内容、提取图中文字，"
+            "请识别这个QQ表情包，用中文简要描述其画面内容、提取图中文字，"
             "并简要说明这个表情包可能表达的情绪或梗的含义。直接描述，不要解释过程。"
         )
     else:
-        prompt = "请用中文描述这张图片的内容及必要的文字原文消息内容。直接描述，不要解释过程。"
+        prompt = "请用中文简要描述这张图片的内容及必要的文字原文消息内容。直接描述，不要解释过程。"
 
     # 三条路依次尝试：get_file（可能给 base64）→ get_image（可能给本地路径或
     # 下载 URL）→ 直接下载。细节见 get_image_base64。
